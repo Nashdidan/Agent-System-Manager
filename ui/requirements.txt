@@ -1,0 +1,1 @@
+# No external dependencies — uses claude CLI subprocess + stdlib only

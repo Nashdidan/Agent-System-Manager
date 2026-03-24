@@ -1,0 +1,2 @@
+cluade api =  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
+ngrok api = 3B7RCSQZm4nwNTeQ2r3cvrLBBX9_37gBt9mhiB5RzJgbrfDhB
