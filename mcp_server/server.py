@@ -136,7 +136,9 @@ def create_project_task(project_id: str, from_project: str, description: str) ->
     db_path = _get_db_path(project_id)
     if not db_path:
         return {"error": f"Project not found: {project_id}"}
-    return project_database.create_task(db_path, from_project, description)
+    result = project_database.create_task(db_path, from_project, description)
+    database.mirror_project_task(result["task_id"], project_id, description)
+    return result
 
 @mcp.tool()
 def get_project_tasks(project_id: str) -> list:
@@ -152,7 +154,9 @@ def complete_project_task(project_id: str, task_id: str, result: str) -> dict:
     db_path = _get_db_path(project_id)
     if not db_path:
         return {"error": f"Project not found: {project_id}"}
-    return project_database.complete_task(db_path, task_id, result)
+    outcome = project_database.complete_task(db_path, task_id, result)
+    database.sync_task_status(task_id, "done", result)
+    return outcome
 
 # ── Wake project agent ───────────────────────────────────────
 

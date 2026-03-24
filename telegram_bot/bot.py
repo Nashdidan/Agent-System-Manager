@@ -242,6 +242,14 @@ def execute_pm_tool(name: str, tool_input: dict) -> str:
                          (task_id, from_project, description, "pending", None, now, now))
             conn.commit()
             conn.close()
+            # Mirror into central DB so PM has full view
+            conn2 = sqlite3.connect(DB_PATH)
+            conn2.execute(
+                "INSERT OR IGNORE INTO tasks VALUES (?,?,?,?,?,?,?,?)",
+                (task_id, "PM", project_id, description, "pending", None, now, now),
+            )
+            conn2.commit()
+            conn2.close()
             return json.dumps({"task_id": task_id, "status": "created"})
 
         elif name == "get_project_tasks":

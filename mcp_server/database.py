@@ -189,6 +189,30 @@ def get_pending_writes() -> list:
     conn.close()
     return [dict(row) for row in rows]
 
+def mirror_project_task(task_id: str, project_id: str, description: str) -> dict:
+    """Mirror a project task into the central DB so the PM has a full view."""
+    conn = get_connection()
+    now = datetime.now().isoformat()
+    conn.execute(
+        "INSERT OR IGNORE INTO tasks VALUES (?,?,?,?,?,?,?,?)",
+        (task_id, "PM", project_id, description, "pending", None, now, now)
+    )
+    conn.commit()
+    conn.close()
+    return {"task_id": task_id, "status": "mirrored"}
+
+def sync_task_status(task_id: str, status: str, result: str) -> dict:
+    """Sync a project task completion back to the central DB."""
+    conn = get_connection()
+    now = datetime.now().isoformat()
+    conn.execute(
+        "UPDATE tasks SET status=?, result=?, updated_at=? WHERE id=?",
+        (status, result, now, task_id)
+    )
+    conn.commit()
+    conn.close()
+    return {"task_id": task_id, "status": status}
+
 def resolve_write(write_id: str, approved: bool) -> dict:
     conn = get_connection()
     status = "approved" if approved else "rejected"
