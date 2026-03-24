@@ -26,6 +26,8 @@ CONVERSATION_PATH    = os.path.join(UI_DIR, "pm_conversation.json")
 DB_PATH              = os.path.join(REPO_DIR, "mcp_server", "agent_system.db")
 PM_MEMORY_PATH       = os.path.join(REPO_DIR, "pm_memory.md")
 PM_INSTRUCTIONS_PATH = os.path.join(REPO_DIR, "pm_instructions.md")
+TELEGRAM_ENV_PATH    = os.path.join(REPO_DIR, "telegram_bot", ".env")
+TELEGRAM_BOT_SCRIPT  = os.path.join(REPO_DIR, "telegram_bot", "bot.py")
 
 PM_MODEL = "claude-sonnet-4-6"
 
@@ -388,6 +390,24 @@ def save_conversation(messages):
     with open(CONVERSATION_PATH, "w", encoding="utf-8") as f:
         json.dump(messages, f, indent=2)
 
+def load_env() -> dict:
+    result = {}
+    if not os.path.exists(TELEGRAM_ENV_PATH):
+        return result
+    with open(TELEGRAM_ENV_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                result[k.strip()] = v.strip()
+    return result
+
+def save_env(data: dict):
+    os.makedirs(os.path.dirname(TELEGRAM_ENV_PATH), exist_ok=True)
+    with open(TELEGRAM_ENV_PATH, "w", encoding="utf-8") as f:
+        for k, v in data.items():
+            f.write(f"{k}={v}\n")
+
 # ── SQLite helpers ────────────────────────────────────────────
 
 def get_pending_writes():
@@ -455,14 +475,22 @@ class App(tk.Tk):
         self._pm_thinking     = False
         self._active_agent_id = "PM"
         self._agent_rows: dict[str, dict] = {}
+        self._bot_process: subprocess.Popen | None = None
 
         self.registry = AgentRegistry()
 
         self._build_ui()
+
+        # Pre-fill API key from .env if present
+        env = load_env()
+        if env.get("ANTHROPIC_API_KEY"):
+            self._api_key_var.set(env["ANTHROPIC_API_KEY"])
+
         self._replay_chat_history()
         self._poll_pending_writes()
         self._poll_feed()
         self._poll_agent_status()
+        self._poll_bot_status()
         self._sync_project_agents()
 
     def _build_api_messages(self) -> list:
@@ -485,7 +513,39 @@ class App(tk.Tk):
 
     def _on_close(self):
         self.registry.kill_all()
+        self._stop_bot()
         self.destroy()
+
+    # ── Settings / bot management ─────────────────────────────
+
+    def _open_settings(self):
+        SettingsDialog(self)
+
+    def _start_bot(self):
+        if self._bot_process and self._bot_process.poll() is None:
+            return
+        env = os.environ.copy()
+        env.update(load_env())
+        self._bot_process = subprocess.Popen(
+            ["python", TELEGRAM_BOT_SCRIPT],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _stop_bot(self):
+        if self._bot_process and self._bot_process.poll() is None:
+            self._bot_process.terminate()
+        self._bot_process = None
+
+    def _poll_bot_status(self):
+        if self._bot_process is not None:
+            if self._bot_process.poll() is None:
+                self._bot_status_label.config(text="● Bot: running", fg="#a6e3a1")
+            else:
+                self._bot_process = None
+                self._bot_status_label.config(text="○ Bot: stopped", fg="#6c7086")
+        self.after(2000, self._poll_bot_status)
 
     # ── UI construction ───────────────────────────────────────
 
@@ -501,6 +561,14 @@ class App(tk.Tk):
         self._pm_status_label = tk.Label(top_bar, text="● idle", bg="#181825",
                                           fg="#a6e3a1", font=("Consolas", 10))
         self._pm_status_label.pack(side=tk.LEFT, padx=16)
+
+        self._bot_status_label = tk.Label(top_bar, text="○ Bot: stopped", bg="#181825",
+                                           fg="#6c7086", font=("Consolas", 10))
+        self._bot_status_label.pack(side=tk.LEFT, padx=8)
+
+        tk.Button(top_bar, text="⚙ Settings", command=self._open_settings,
+                  bg="#45475a", fg="#cdd6f4", relief=tk.FLAT,
+                  font=("Consolas", 10), padx=8).pack(side=tk.RIGHT, padx=8)
 
         main = tk.Frame(self, bg="#1e1e2e")
         main.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -1162,6 +1230,109 @@ class ProjectDialog(tk.Toplevel):
             messagebox.showerror("Missing fields", "ID, Name and Path are required.")
             return
         self._on_save(data)
+        self.destroy()
+
+
+# ── Settings dialog ───────────────────────────────────────────
+
+class SettingsDialog(tk.Toplevel):
+    _FIELDS = [
+        ("ANTHROPIC_API_KEY",  "Anthropic API Key",  True),
+        ("TELEGRAM_BOT_TOKEN", "Telegram Bot Token", True),
+        ("TELEGRAM_CHAT_ID",   "Telegram Chat ID",   False),
+    ]
+
+    def __init__(self, app: "App"):
+        super().__init__(app)
+        self._app = app
+        self.title("Settings")
+        self.configure(bg="#1e1e2e")
+        self.resizable(False, False)
+        self.grab_set()
+
+        env = load_env()
+
+        tk.Label(self, text="API Keys", bg="#1e1e2e", fg="#89b4fa",
+                 font=("Consolas", 11, "bold")).pack(anchor=tk.W, padx=16, pady=(12, 4))
+
+        self._vars = {}
+        for key, label, masked in self._FIELDS:
+            row = tk.Frame(self, bg="#1e1e2e")
+            row.pack(fill=tk.X, padx=16, pady=3)
+            tk.Label(row, text=label, bg="#1e1e2e", fg="#cdd6f4",
+                     font=("Consolas", 10), width=22, anchor=tk.W).pack(side=tk.LEFT)
+            var = tk.StringVar(value=env.get(key, ""))
+            self._vars[key] = var
+            entry = tk.Entry(row, textvariable=var, show="*" if masked else "",
+                             bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4",
+                             relief=tk.FLAT, font=("Consolas", 10), width=40)
+            entry.pack(side=tk.LEFT, padx=4)
+            if masked:
+                def _make_toggle(e=entry):
+                    def _toggle():
+                        e.config(show="" if e.cget("show") == "*" else "*")
+                    return _toggle
+                tk.Button(row, text="👁", command=_make_toggle(),
+                          bg="#313244", fg="#cdd6f4", relief=tk.FLAT,
+                          font=("Consolas", 9), padx=4).pack(side=tk.LEFT)
+
+        tk.Frame(self, bg="#313244", height=1).pack(fill=tk.X, padx=16, pady=8)
+
+        tk.Label(self, text="Telegram Bot", bg="#1e1e2e", fg="#89b4fa",
+                 font=("Consolas", 11, "bold")).pack(anchor=tk.W, padx=16, pady=(0, 6))
+
+        bot_row = tk.Frame(self, bg="#1e1e2e")
+        bot_row.pack(fill=tk.X, padx=16, pady=(0, 8))
+
+        self._status_var = tk.StringVar()
+        tk.Label(bot_row, textvariable=self._status_var, bg="#1e1e2e",
+                 fg="#cdd6f4", font=("Consolas", 10), width=20, anchor=tk.W).pack(side=tk.LEFT)
+
+        self._start_btn = tk.Button(bot_row, text="Start Bot", command=self._start_bot,
+                                     bg="#a6e3a1", fg="#1e1e2e", relief=tk.FLAT,
+                                     font=("Consolas", 10, "bold"), padx=10)
+        self._start_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        self._stop_btn = tk.Button(bot_row, text="Stop Bot", command=self._stop_bot,
+                                    bg="#f38ba8", fg="#1e1e2e", relief=tk.FLAT,
+                                    font=("Consolas", 10, "bold"), padx=10)
+        self._stop_btn.pack(side=tk.LEFT)
+
+        btn_row = tk.Frame(self, bg="#1e1e2e")
+        btn_row.pack(pady=12)
+        tk.Button(btn_row, text="Save", command=self._save,
+                  bg="#89b4fa", fg="#1e1e2e", relief=tk.FLAT,
+                  font=("Consolas", 11, "bold"), padx=14).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_row, text="Cancel", command=self.destroy,
+                  bg="#45475a", fg="#cdd6f4", relief=tk.FLAT,
+                  font=("Consolas", 10), padx=10).pack(side=tk.LEFT)
+
+        self._refresh()
+
+    def _is_bot_running(self) -> bool:
+        return (self._app._bot_process is not None and
+                self._app._bot_process.poll() is None)
+
+    def _refresh(self):
+        running = self._is_bot_running()
+        self._status_var.set("● running" if running else "○ stopped")
+        self._start_btn.config(state=tk.DISABLED if running else tk.NORMAL)
+        self._stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
+        if self.winfo_exists():
+            self.after(1000, self._refresh)
+
+    def _start_bot(self):
+        self._app._start_bot()
+
+    def _stop_bot(self):
+        self._app._stop_bot()
+
+    def _save(self):
+        data = {k: v.get().strip() for k, v in self._vars.items()}
+        save_env(data)
+        if data.get("ANTHROPIC_API_KEY"):
+            self._app._api_key_var.set(data["ANTHROPIC_API_KEY"])
+        messagebox.showinfo("Saved", "Settings saved.", parent=self)
         self.destroy()
 
 

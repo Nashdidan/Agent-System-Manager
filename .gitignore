@@ -211,3 +211,4 @@ mcp_server/agent_system.db
 ui/pm_conversation.json
 telegram_bot/.env
 agents/sapi.txt
+projects.json
