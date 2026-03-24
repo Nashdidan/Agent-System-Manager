@@ -225,6 +225,14 @@ def execute_pm_tool(name: str, tool_input: dict) -> str:
             )
             conn.commit()
             conn.close()
+            # Mirror into central DB so PM has full view
+            conn2 = sqlite3.connect(DB_PATH)
+            conn2.execute(
+                "INSERT OR IGNORE INTO tasks VALUES (?,?,?,?,?,?,?,?)",
+                (task_id, "PM", project_id, description, "pending", None, now, now),
+            )
+            conn2.commit()
+            conn2.close()
             return json.dumps({"task_id": task_id, "status": "created"})
 
         elif name == "get_project_tasks":
@@ -824,17 +832,26 @@ class App(tk.Tk):
                 base = f.read().strip() + "\n\n"
         project_id = project.get("id", "unknown")
         project_path = project.get("path", "")
+        db_path = project.get("db_path", "")
         rules = (
             f"## Your identity\n"
             f"You are an engineer for project '{project_id}' at {project_path}.\n\n"
+            f"## Your tools\n"
+            f"Use only native tools: Read, Write, Edit, Bash, Glob, Grep.\n"
+            f"You have NO access to any MCP server — do not attempt to call MCP tools.\n\n"
             f"## Task queue\n"
-            f"You have a task queue in a database. At the start of every conversation, "
-            f"call `mcp__agent-system__get_project_tasks` with project_id='{project_id}' "
-            f"to check for pending tasks assigned by the PM. Process them before responding.\n\n"
-            f"When you complete a task, call `mcp__agent-system__complete_project_task` "
-            f"with project_id='{project_id}', task_id, and a result summary.\n\n"
-            f"## How to write files\n"
-            f"You can use Edit/Write tools directly — permissions are pre-approved.\n"
+            f"The PM will inject your pending tasks directly into the conversation.\n"
+            f"Each task will have an ID, implement it using your file tools.\n\n"
+            f"## Marking tasks done\n"
+            f"When you finish a task, update its status in the project DB using Bash:\n"
+            f"```\n"
+            f'python -c "import sqlite3, datetime; conn = sqlite3.connect(r\'{db_path}\'); '
+            f'conn.execute(\'UPDATE tasks SET status=\\\"done\\\", result=?, updated_at=? WHERE id=?\', '
+            f'[\'done - waiting for PM approval: <summary>\', datetime.datetime.now().isoformat(), \'<task_id>\']); '
+            f'conn.commit(); conn.close()"\n'
+            f"```\n"
+            f"Replace <task_id> with the actual task ID and <summary> with what you did.\n"
+            f"Always end your result with 'done - waiting for PM approval'.\n"
         )
         return base + rules
 
