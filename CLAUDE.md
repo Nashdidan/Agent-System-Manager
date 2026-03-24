@@ -47,16 +47,24 @@ agent-system\
 
 ```powershell
 # Terminal 1 — MCP server (required for engineer agents)
-cd C:\Idan\Projects\agent-system\mcp_server
+cd mcp_server
 .\.venv\Scripts\Activate.ps1
 python server.py
 
-# Terminal 2 — UI
-cd C:\Idan\Projects\agent-system\ui
+# Terminal 2 — Tkinter UI (primary interface)
+cd ui
 python main.py
+
+# OR: Telegram bot (alternative interface — shares pm_conversation.json with the UI)
+cd telegram_bot
+pip install -r requirements.txt
+# Set env vars: TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, TELEGRAM_CHAT_ID
+python bot.py
 ```
 
 No ngrok needed. The MCP server is registered in `~/.claude/settings.json` at `http://localhost:8000/mcp` for engineer subprocesses.
+
+The Tkinter UI and Telegram bot can run as alternatives (they share `pm_conversation.json` and `agent_system.db`). Running both simultaneously against the same conversation is not designed for.
 
 ## How It Works
 
@@ -70,18 +78,22 @@ No ngrok needed. The MCP server is registered in `~/.claude/settings.json` at `h
 8. Engineer calls `write_project_event` → background watcher in server.py wakes PM → PM writes to `pm_feed`
 9. Live feed panel shows PM feed entries in real time
 
-## PM Tools (defined in ui/main.py as PM_TOOLS)
+## PM Tools (defined in ui/main.py and telegram_bot/bot.py as PM_TOOLS)
 
-| Tool | Executed by UI as |
+`PM_TOOLS` and `execute_pm_tool` are duplicated in both `ui/main.py` and `telegram_bot/bot.py`. When adding or changing a PM tool, update both files.
+
+| Tool | Executed by UI/bot as |
 |---|---|
 | `get_projects` | reads `projects.json` |
 | `get_all_status` | sqlite query on `agent_system.db` tasks |
 | `create_project_task` | sqlite insert into project's `agent.db` |
-| `get_project_tasks` | sqlite query on project's `agent.db` |
+| `get_project_tasks` | sqlite query on project's `agent.db` (pending only) |
 | `complete_project_task` | sqlite update on project's `agent.db` |
-| `wake_project_agent` | spawns `claude -p` subprocess |
+| `wake_project_agent` | spawns `claude -p` subprocess (fire and forget) |
+| `ask_project_agent` | spawns `claude -p` subprocess, waits (up to 120s) for output |
 | `write_pm_feed` | sqlite insert into `agent_system.db` pm_feed |
 | `save_pm_memory` | writes `pm_memory.md` |
+| `cleanup_project_tasks` | deletes done tasks from project's `agent.db` |
 | `read_file` / `list_dir` | direct filesystem access |
 
 ## Database Schema
@@ -117,8 +129,10 @@ events(id, type, content, status, created_at)
 
 ## Key Notes
 
-- `agent_system.db` is created in whichever directory `server.py` is run from — always run from `mcp_server\`
-- `pm_conversation.json` stores text-only conversation; delete it to reset PM memory
-- `_api_messages` (in-memory) keeps full Anthropic format with tool_use/tool_result blocks for accurate context
-- `write_file` (MCP tool used by engineers) never writes immediately — always goes through diff approval UI
-- The background event watcher in `server.py` polls all project DBs every 3s for `write_project_event` calls
+- `agent_system.db` is created relative to CWD — always run `server.py` from `mcp_server\`
+- `pm_conversation.json` stores text-only messages; delete it to reset the PM's chat history
+- `_api_messages` (in-memory in `ui/main.py`) keeps full Anthropic format with tool_use/tool_result blocks for accurate API context
+- `write_file` (MCP tool used by engineers) never writes immediately — always goes through the diff approval UI or Telegram inline buttons
+- The background event watcher in `server.py` polls all project DBs every 3s; when it finds unprocessed events it spawns a separate `claude -p` PM process (not the UI's PM)
+- `server.py` sets `FASTMCP_PORT=8001` via env var but `mcp.run(port=8000)` overrides it — the server listens on **8000**
+- `agents/` contains legacy PowerShell scripts (`pm_agent.ps1`, `be_agent.ps1`) from an earlier ngrok-based approach; they are not part of the current UI architecture

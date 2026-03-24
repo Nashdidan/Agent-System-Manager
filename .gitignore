@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Agent system runtime files
+mcp_server/agent_system.db
+ui/pm_conversation.json
+telegram_bot/.env
+agents/sapi.txt
