@@ -29,3 +29,8 @@
 
   Same conversation as the desktop UI, just on your phone. Set it up from **⚙ Settings** — you'll need a bot token from
   BotFatherand your chat ID.
+
+  1. Install dependencies: `pip install -r requirements.txt` inside `telegram_bot/`
+  2. Get a bot token from [@BotFather](https://t.me/botfather)
+  3. Open Settings in the UI → enter your `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` → Save
+  4. Hit Start Bot — the UI handles the rest
