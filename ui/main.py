@@ -529,11 +529,38 @@ class App(tk.Tk):
     def _open_settings(self):
         SettingsDialog(self)
 
+    def _check_bot_conflict(self, token: str) -> bool:
+        """Returns True if another bot instance is already polling Telegram."""
+        import urllib.request
+        import urllib.error
+        try:
+            url = f"https://api.telegram.org/bot{token}/getUpdates?timeout=0&limit=1"
+            urllib.request.urlopen(url, timeout=5)
+            return False
+        except urllib.error.HTTPError as e:
+            return e.code == 409
+        except Exception:
+            return False
+
     def _start_bot(self):
         if self._bot_process and self._bot_process.poll() is None:
+            messagebox.showwarning("Bot already running",
+                                   "The bot is already running from this UI.")
             return
         env = os.environ.copy()
         env.update(load_env())
+        token = env.get("TELEGRAM_BOT_TOKEN", "")
+        if not token:
+            messagebox.showerror("Missing token",
+                                 "Set TELEGRAM_BOT_TOKEN in Settings before starting the bot.")
+            return
+        if self._check_bot_conflict(token):
+            messagebox.showerror(
+                "Bot already running",
+                "Another bot instance is already running with this token.\n\n"
+                "Stop it before starting a new one."
+            )
+            return
         self._bot_process = subprocess.Popen(
             ["python", TELEGRAM_BOT_SCRIPT],
             env=env,
@@ -560,12 +587,7 @@ class App(tk.Tk):
     def _build_ui(self):
         top_bar = tk.Frame(self, bg="#181825", pady=6)
         top_bar.pack(fill=tk.X, padx=8, pady=(8, 0))
-        tk.Label(top_bar, text="API Key:", bg="#181825", fg="#6c7086",
-                 font=("Consolas", 10)).pack(side=tk.LEFT, padx=(8, 4))
         self._api_key_var = tk.StringVar()
-        tk.Entry(top_bar, textvariable=self._api_key_var, show="*",
-                 bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4",
-                 relief=tk.FLAT, font=("Consolas", 10), width=48).pack(side=tk.LEFT, ipady=3)
         self._pm_status_label = tk.Label(top_bar, text="● idle", bg="#181825",
                                           fg="#a6e3a1", font=("Consolas", 10))
         self._pm_status_label.pack(side=tk.LEFT, padx=16)
@@ -970,7 +992,7 @@ class App(tk.Tk):
                 return
             api_key = self._api_key_var.get().strip()
             if not api_key or not api_key.startswith("sk-ant-"):
-                messagebox.showerror("API Key", "Enter a valid Anthropic API key (starts with sk-ant-).")
+                messagebox.showerror("API Key", "No valid Anthropic API key found. Add it in ⚙ Settings.")
                 return
             self.input_var.set("")
             self._append_chat("user", text)
