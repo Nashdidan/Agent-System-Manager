@@ -132,8 +132,25 @@ def build_agents_panel(parent: tk.Frame, app):
                         font=FONT_MONO, cursor="hand2")
     pm_label.pack(side=tk.LEFT)
     pm_label.bind("<Button-1>", lambda e: app._switch_agent("PM"))
-    tk.Label(pm_row, text="[API]", bg=BG_HIGHLIGHT, fg=FG_DIM,
-             font=FONT_MONO_SM).pack(side=tk.LEFT, padx=4)
+    app._pm_mode_label = tk.Label(pm_row, text="[API]", bg=BG_HIGHLIGHT, fg=FG_DIM,
+                                   font=FONT_MONO_SM)
+    app._pm_mode_label.pack(side=tk.LEFT, padx=4)
+
+    # Wake/Kill buttons for CLI mode (hidden by default)
+    pm_btn_frame = tk.Frame(pm_row, bg=BG_HIGHLIGHT)
+    pm_btn_frame.pack(side=tk.RIGHT)
+    app._pm_wake_btn = tk.Button(pm_btn_frame, text="Wake",
+                                  command=app._wake_pm_cli,
+                                  bg=BG_SURFACE, fg=FG_GREEN, relief=tk.FLAT,
+                                  font=FONT_MONO_SM, padx=4)
+    app._pm_kill_btn = tk.Button(pm_btn_frame, text="Kill",
+                                  command=app._kill_pm_cli,
+                                  bg=BG_SURFACE, fg=FG_RED, relief=tk.FLAT,
+                                  font=FONT_MONO_SM, padx=4)
+    # Hidden initially (API mode)
+    app._pm_wake_btn.pack_forget()
+    app._pm_kill_btn.pack_forget()
+
     app._agent_rows["PM"] = {"dot": app._pm_dot, "label": pm_label, "row": pm_row}
 
     tk.Frame(parent, bg=BG_SURFACE, height=1).pack(fill=tk.X, padx=6, pady=8)

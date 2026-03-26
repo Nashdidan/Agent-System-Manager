@@ -20,11 +20,12 @@ from theme import (
 from pm_engine import (
     anthropic, PM_TOOLS, PM_MODEL, REPO_DIR, TELEGRAM_BOT_SCRIPT,
     load_projects, save_projects, load_conversation, save_conversation,
-    load_env, load_pm_system_prompt, ensure_project_db,
+    load_env, load_pm_system_prompt, ensure_project_db, ensure_central_db,
     execute_pm_tool, trim_messages,
     get_pending_writes, resolve_write_db, get_feed_since,
     get_project_approvals, resolve_project_approval,
-    inject_pending_tasks, engineer_system_prompt,
+    inject_pending_tasks, engineer_system_prompt, cli_pm_system_prompt,
+    get_unprocessed_events, mark_event_processing, write_pm_feed_direct,
 )
 from panels import (
     PanelManager,
@@ -42,6 +43,7 @@ class App(tk.Tk):
         self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        ensure_central_db()
         self.conversation   = load_conversation()
         self._api_messages  = self._build_api_messages()
 
@@ -52,8 +54,18 @@ class App(tk.Tk):
         self._active_agent_id = "PM"
         self._agent_rows: dict[str, dict] = {}
         self._bot_process: subprocess.Popen | None = None
+        self._pm_mode = "api"  # "api" or "cli"
 
         self.registry = AgentRegistry()
+
+        # Create a PM CLI agent (used when mode is "cli")
+        from agent_manager import AgentProcess
+        self._pm_cli_agent = AgentProcess(
+            "PM_CLI", "PM (CLI)", REPO_DIR,
+            system_prompt=cli_pm_system_prompt(),
+            on_session_saved=lambda aid, sid: None,
+        )
+        self._pm_cli_agent.start()
 
         self._build_ui()
 
@@ -67,6 +79,7 @@ class App(tk.Tk):
         self._poll_agent_status()
         self._poll_bot_status()
         self._sync_project_agents()
+        self._poll_events()
 
     # ── API message building ─────────────────────────────────
 
@@ -79,6 +92,7 @@ class App(tk.Tk):
 
     def _on_close(self):
         self.registry.kill_all()
+        self._pm_cli_agent.kill()
         self._stop_bot()
         self.destroy()
 
@@ -100,6 +114,31 @@ class App(tk.Tk):
         tk.Button(top_bar, text="\u2699 Settings", command=self._open_settings,
                   **BTN_MUTED).pack(side=tk.RIGHT, padx=8)
 
+        # PM mode toggle
+        mode_frame = tk.Frame(top_bar, bg=BG_SECONDARY)
+        mode_frame.pack(side=tk.RIGHT, padx=8)
+        tk.Label(mode_frame, text="PM:", bg=BG_SECONDARY, fg=FG_DIM,
+                 font=FONT_MONO_SM).pack(side=tk.LEFT, padx=(0, 4))
+        self._pm_mode_var = tk.StringVar(value="api")
+        self._api_radio = tk.Radiobutton(
+            mode_frame, text="API", variable=self._pm_mode_var, value="api",
+            command=self._on_pm_mode_changed,
+            bg=BG_SECONDARY, fg=FG_BLUE, selectcolor=BG_SURFACE,
+            activebackground=BG_SECONDARY, activeforeground=FG_BLUE,
+            font=FONT_MONO_BOLD, indicatoron=False, padx=8, pady=2,
+            relief=tk.FLAT, bd=0,
+        )
+        self._api_radio.pack(side=tk.LEFT, padx=1)
+        self._cli_radio = tk.Radiobutton(
+            mode_frame, text="CLI", variable=self._pm_mode_var, value="cli",
+            command=self._on_pm_mode_changed,
+            bg=BG_SECONDARY, fg=FG_DIM, selectcolor=BG_SURFACE,
+            activebackground=BG_SECONDARY, activeforeground=FG_GREEN,
+            font=FONT_MONO_BOLD, indicatoron=False, padx=8, pady=2,
+            relief=tk.FLAT, bd=0,
+        )
+        self._cli_radio.pack(side=tk.LEFT, padx=1)
+
         # Main PanedWindow with 4 resizable/detachable panels
         paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg=BG_SASH,
                                sashwidth=5, sashrelief=tk.FLAT)
@@ -119,6 +158,45 @@ class App(tk.Tk):
         self.panel_mgr.add("approvals", "Pending File Changes",
                            lambda p: build_approvals_panel(p, self),
                            minsize=180, width=280)
+
+    # ── PM mode toggle ───────────────────────────────────────
+
+    def _on_pm_mode_changed(self):
+        mode = self._pm_mode_var.get()
+        if self._pm_thinking:
+            self._pm_mode_var.set(self._pm_mode)
+            messagebox.showinfo("PM is busy", "Wait for the PM to finish before switching modes.")
+            return
+        self._pm_mode = mode
+        if mode == "api":
+            self._api_radio.config(fg=FG_BLUE)
+            self._cli_radio.config(fg=FG_DIM)
+            self._pm_status_label.config(text="\u25cf API idle", fg=FG_GREEN)
+            self._pm_mode_label.config(text="[API]")
+            self._pm_wake_btn.pack_forget()
+            self._pm_kill_btn.pack_forget()
+        else:
+            self._api_radio.config(fg=FG_DIM)
+            self._cli_radio.config(fg=FG_GREEN)
+            self._pm_status_label.config(text="\u25cf CLI idle", fg=FG_GREEN)
+            self._pm_mode_label.config(text="[CLI]")
+            self._pm_wake_btn.pack(side=tk.LEFT, padx=1)
+            self._pm_kill_btn.pack(side=tk.LEFT, padx=1)
+
+    def _wake_pm_cli(self):
+        if self._pm_cli_agent.status == DEAD:
+            self._pm_cli_agent.start()
+
+    def _kill_pm_cli(self):
+        self._pm_cli_agent.kill()
+        # Recreate with fresh system prompt
+        from agent_manager import AgentProcess
+        self._pm_cli_agent = AgentProcess(
+            "PM_CLI", "PM (CLI)", REPO_DIR,
+            system_prompt=cli_pm_system_prompt(),
+            on_session_saved=lambda aid, sid: None,
+        )
+        self._pm_cli_agent.start()
 
     # ── Settings / bot management ────────────────────────────
 
@@ -347,12 +425,21 @@ class App(tk.Tk):
 
     def _set_pm_thinking(self, thinking: bool):
         self._pm_thinking = thinking
+        mode_label = "API" if self._pm_mode == "api" else "CLI"
         if thinking:
             self._pm_dot.config(text="\u25cc", fg=FG_YELLOW)
-            self._pm_status_label.config(text="\u25cc thinking", fg=FG_YELLOW)
+            self._pm_status_label.config(text=f"\u25cc {mode_label} thinking", fg=FG_YELLOW)
         else:
             self._pm_dot.config(text="\u25cf", fg=FG_GREEN)
-            self._pm_status_label.config(text="\u25cf idle", fg=FG_GREEN)
+            self._pm_status_label.config(text=f"\u25cf {mode_label} idle", fg=FG_GREEN)
+
+    def _pm_cli_done(self, user_message: str):
+        self._append_chat("pm", "\n")
+        self._set_pm_thinking(False)
+
+    def _pm_cli_error(self, err: str):
+        self._append_chat("error", err)
+        self._set_pm_thinking(False)
 
     def _send_message(self):
         text = self.input_var.get().strip()
@@ -360,24 +447,41 @@ class App(tk.Tk):
             return
 
         if self._active_agent_id == "PM":
-            if not anthropic:
-                messagebox.showerror("Missing package",
-                                     "anthropic package not installed.\nRun: pip install anthropic")
-                return
             if self._pm_thinking:
                 messagebox.showinfo("PM is busy", "The PM is currently thinking. Please wait.")
                 return
-            api_key = self._api_key_var.get().strip()
-            if not api_key or not api_key.startswith("sk-ant-"):
-                messagebox.showerror("API Key", "No valid Anthropic API key found. Add it in \u2699 Settings.")
-                return
-            self.input_var.set("")
-            self._append_chat("user", text)
-            self._append_chat("pm_start", "")
-            self._pm_buffer = ""
-            self._set_pm_thinking(True)
-            threading.Thread(target=self._pm_api_loop, args=(text, api_key),
-                             daemon=True).start()
+
+            if self._pm_mode == "api":
+                # API mode
+                if not anthropic:
+                    messagebox.showerror("Missing package",
+                                         "anthropic package not installed.\nRun: pip install anthropic")
+                    return
+                api_key = self._api_key_var.get().strip()
+                if not api_key or not api_key.startswith("sk-ant-"):
+                    messagebox.showerror("API Key", "No valid Anthropic API key found. Add it in \u2699 Settings.")
+                    return
+                self.input_var.set("")
+                self._append_chat("user", text)
+                self._append_chat("pm_start", "")
+                self._pm_buffer = ""
+                self._set_pm_thinking(True)
+                threading.Thread(target=self._pm_api_loop, args=(text, api_key),
+                                 daemon=True).start()
+            else:
+                # CLI mode — route through AgentProcess
+                if self._pm_cli_agent.status == DEAD:
+                    self._pm_cli_agent.start()
+                self.input_var.set("")
+                self._append_chat("user", text)
+                self._append_chat("pm_start", "")
+                self._set_pm_thinking(True)
+                self._pm_cli_agent.send(
+                    text,
+                    on_chunk=lambda chunk: self.after(0, self._append_chat, "pm", chunk),
+                    on_done=lambda: self.after(0, self._pm_cli_done, text),
+                    on_error=lambda err: self.after(0, self._pm_cli_error, err),
+                )
         else:
             agent = self.registry.get(self._active_agent_id)
             if not agent:
@@ -500,6 +604,29 @@ class App(tk.Tk):
         self.feed_box.insert(tk.END, summary + "\n", event_type)
         self.feed_box.configure(state=tk.DISABLED)
         self.feed_box.see(tk.END)
+
+    # ── Event watcher (replaces MCP server's watcher) ──────
+
+    def _poll_events(self):
+        """Poll all project DBs for unprocessed events — replaces server.py's _event_watcher."""
+        try:
+            for p in load_projects():
+                db_path = p.get("db_path")
+                if not db_path or not os.path.exists(db_path):
+                    continue
+                events = get_unprocessed_events(db_path)
+                if events:
+                    for e in events:
+                        mark_event_processing(db_path, e["id"])
+                    summary = ", ".join(f"{e['type']}: {e['content']}" for e in events)
+                    write_pm_feed_direct(
+                        f"[{p['name']}] {summary}",
+                        project_id=p["id"],
+                        event_type="info",
+                    )
+        except Exception:
+            pass
+        self.after(3000, self._poll_events)
 
     # ── Pending writes / approvals ───────────────────────────
 
