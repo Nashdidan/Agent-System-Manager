@@ -7,6 +7,21 @@ IDLE     = "idle"
 THINKING = "thinking"
 DEAD     = "dead"
 
+SESSIONS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_sessions.json")
+
+def _load_sessions() -> dict:
+    if os.path.exists(SESSIONS_PATH):
+        try:
+            with open(SESSIONS_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def _save_sessions(sessions: dict):
+    with open(SESSIONS_PATH, "w", encoding="utf-8") as f:
+        json.dump(sessions, f, indent=2)
+
 
 class AgentProcess:
     """
@@ -16,16 +31,19 @@ class AgentProcess:
     """
 
     def __init__(self, agent_id: str, display_name: str, cwd: str, system_prompt: str = None,
-                 allowed_tools: str = None):
-        self.agent_id      = agent_id
-        self.display_name  = display_name
-        self.cwd           = cwd
-        self.system_prompt = system_prompt
-        self.allowed_tools = allowed_tools  # comma-separated tool names
-        self.status        = DEAD
-        self._proc         = None
-        self._has_session  = False  # True after first successful run
-        self._lock         = threading.Lock()
+                 allowed_tools: str = None, session_id: str = None,
+                 on_session_saved=None):
+        self.agent_id         = agent_id
+        self.display_name     = display_name
+        self.cwd              = cwd
+        self.system_prompt    = system_prompt
+        self.allowed_tools    = allowed_tools
+        self.session_id       = session_id        # persisted across restarts
+        self._on_session_saved = on_session_saved # callback(agent_id, session_id)
+        self.status           = DEAD
+        self._proc            = None
+        self._has_session     = session_id is not None
+        self._lock            = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────
 
@@ -48,7 +66,10 @@ class AgentProcess:
                         pass
             self._proc        = None
             self._has_session = False
+            self.session_id   = None
             self.status       = DEAD
+        if self._on_session_saved:
+            self._on_session_saved(self.agent_id, None)
 
     def is_alive(self) -> bool:
         """True if ready or currently thinking (has a session or is running)."""
@@ -77,10 +98,11 @@ class AgentProcess:
     def _run(self, message: str, on_chunk, on_done, on_error):
         try:
             cmd = ["claude", "-p", message, "--output-format", "stream-json", "--verbose",
-                   "--dangerously-skip-permissions"]
+                   "--dangerously-skip-permissions", "--allowedTools", "Read,Glob,Grep,Bash"]
 
-            # Resume session if we have one, otherwise set system prompt
-            if self._has_session:
+            if self.session_id:
+                cmd += ["--resume", self.session_id]
+            elif self._has_session:
                 cmd += ["--continue"]
             elif self.system_prompt:
                 cmd += ["--system-prompt", self.system_prompt]
@@ -119,6 +141,11 @@ class AgentProcess:
                         on_chunk(event["text"])
 
                 elif etype == "result":
+                    new_session_id = event.get("session_id")
+                    if new_session_id and new_session_id != self.session_id:
+                        self.session_id = new_session_id
+                        if self._on_session_saved:
+                            self._on_session_saved(self.agent_id, new_session_id)
                     self._has_session = True
                     with self._lock:
                         self._proc  = None
@@ -169,14 +196,25 @@ class AgentProcess:
 class AgentRegistry:
     def __init__(self):
         self._agents: dict[str, AgentProcess] = {}
+        self._sessions = _load_sessions()
         self._lock = threading.Lock()
+
+    def _on_session_saved(self, agent_id: str, session_id: str | None):
+        if session_id is None:
+            self._sessions.pop(agent_id, None)
+        else:
+            self._sessions[agent_id] = session_id
+        _save_sessions(self._sessions)
 
     def get_or_create(self, agent_id: str, display_name: str, cwd: str,
                       system_prompt: str = None, allowed_tools: str = None) -> AgentProcess:
         with self._lock:
             if agent_id not in self._agents:
-                self._agents[agent_id] = AgentProcess(agent_id, display_name, cwd,
-                                                       system_prompt, allowed_tools)
+                session_id = self._sessions.get(agent_id)
+                self._agents[agent_id] = AgentProcess(
+                    agent_id, display_name, cwd, system_prompt, allowed_tools,
+                    session_id=session_id, on_session_saved=self._on_session_saved,
+                )
             return self._agents[agent_id]
 
     def get(self, agent_id: str) -> AgentProcess | None:

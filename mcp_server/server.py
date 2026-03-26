@@ -310,9 +310,9 @@ def _event_watcher():
                     db_path = p.get("db_path")
                     if not db_path or not os.path.exists(db_path):
                         continue
+                    # Check for completion events
                     events = project_database.get_unprocessed_events(db_path)
                     if events:
-                        # Mark all as processing to avoid duplicate triggers
                         for e in events:
                             project_database.mark_event_processing(db_path, e["id"])
                         summary = "\n".join(
@@ -326,6 +326,14 @@ def _event_watcher():
                             f"mark them done with mark_project_event_done."
                         )
                         _wake_pm(reason)
+                    # Check for pending approval requests
+                    approvals = project_database.get_pending_approvals(db_path)
+                    for a in approvals:
+                        database.write_pm_feed(
+                            f"[{p['name']}] Engineer requesting approval to write: {a['file_path']} — {a['description']}",
+                            project_id=p["id"],
+                            event_type="question",
+                        )
         except Exception:
             pass
         time.sleep(3)
@@ -334,4 +342,4 @@ watcher_thread = threading.Thread(target=_event_watcher, daemon=True)
 watcher_thread.start()
 
 if __name__ == "__main__":
-    mcp.run(transport="http", host="0.0.0.0", port=8000)
+    mcp.run(transport="http", host="0.0.0.0", port=8001)
