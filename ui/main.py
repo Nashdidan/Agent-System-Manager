@@ -1,490 +1,44 @@
+"""
+Agent System — main application.
+Thin App class that wires together panels, dialogs, and the PM engine.
+"""
+
 import tkinter as tk
 from tkinter import messagebox
-import json
 import os
-import sqlite3
-import difflib
 import threading
-import uuid
 import subprocess
-from datetime import datetime
-
-try:
-    import anthropic
-except ImportError:
-    anthropic = None
 
 from agent_manager import AgentRegistry, IDLE, THINKING, DEAD
+from theme import (
+    BG_PRIMARY, BG_SECONDARY, BG_SURFACE, BG_SASH,
+    FG_PRIMARY, FG_DIM, FG_BLUE, FG_GREEN, FG_RED, FG_YELLOW,
+    FONT_MONO, FONT_MONO_SM, FONT_MONO_MD, FONT_MONO_LG,
+    FONT_MONO_BOLD, FONT_MONO_MD_BOLD,
+    BTN_MUTED, BTN_SMALL, SCROLLBAR,
+)
+from pm_engine import (
+    anthropic, PM_TOOLS, PM_MODEL, REPO_DIR, TELEGRAM_BOT_SCRIPT,
+    load_projects, save_projects, load_conversation, save_conversation,
+    load_env, load_pm_system_prompt, ensure_project_db,
+    execute_pm_tool, trim_messages,
+    get_pending_writes, resolve_write_db, get_feed_since,
+    get_project_approvals, resolve_project_approval,
+    inject_pending_tasks, engineer_system_prompt,
+)
+from panels import (
+    PanelManager,
+    build_agents_panel, build_chat_panel, build_feed_panel, build_approvals_panel,
+)
+from dialogs import ReviewWindow, ProjectDialog, SettingsDialog
 
-# ── Paths ─────────────────────────────────────────────────────
-
-UI_DIR   = os.path.dirname(os.path.abspath(__file__))
-REPO_DIR = os.path.dirname(UI_DIR)
-
-PROJECTS_PATH        = os.path.join(REPO_DIR, "projects.json")
-CONVERSATION_PATH    = os.path.join(UI_DIR, "pm_conversation.json")
-DB_PATH              = os.path.join(REPO_DIR, "mcp_server", "agent_system.db")
-PM_MEMORY_PATH       = os.path.join(REPO_DIR, "pm_memory.md")
-PM_INSTRUCTIONS_PATH = os.path.join(REPO_DIR, "pm_instructions.md")
-TELEGRAM_ENV_PATH    = os.path.join(REPO_DIR, "telegram_bot", ".env")
-TELEGRAM_BOT_SCRIPT  = os.path.join(REPO_DIR, "telegram_bot", "bot.py")
-
-PM_MODEL = "claude-sonnet-4-6"
-
-# ── PM Tools (Anthropic tool schemas) ─────────────────────────
-
-PM_TOOLS = [
-    {
-        "name": "get_projects",
-        "description": "Get all registered projects.",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "get_all_status",
-        "description": "Get the status of all central tasks.",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "create_project_task",
-        "description": "Create a task in a project's local DB. The engineer picks it up when woken.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "project_id":   {"type": "string", "description": "Which project does this task"},
-                "from_project": {"type": "string", "description": "Who assigns it — use 'PM'"},
-                "description":  {"type": "string", "description": "Detailed description of what to implement"},
-            },
-            "required": ["project_id", "from_project", "description"],
-        },
-    },
-    {
-        "name": "get_project_tasks",
-        "description": "Get all pending tasks for a project.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"project_id": {"type": "string"}},
-            "required": ["project_id"],
-        },
-    },
-    {
-        "name": "complete_project_task",
-        "description": "Mark a project task as complete.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "project_id": {"type": "string"},
-                "task_id":    {"type": "string"},
-                "result":     {"type": "string"},
-            },
-            "required": ["project_id", "task_id", "result"],
-        },
-    },
-    {
-        "name": "wake_project_agent",
-        "description": "Wake up a project's engineer to process pending tasks. Always call after create_project_task.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"project_id": {"type": "string"}},
-            "required": ["project_id"],
-        },
-    },
-    {
-        "name": "write_pm_feed",
-        "description": "Write a summary to the live feed in the UI. Call after any significant action.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "summary":    {"type": "string"},
-                "project_id": {"type": "string"},
-                "event_type": {
-                    "type": "string",
-                    "enum": ["info", "task_created", "task_done", "bug", "question"],
-                },
-            },
-            "required": ["summary"],
-        },
-    },
-    {
-        "name": "save_pm_memory",
-        "description": "Save persistent notes for your next session. Call at the end of each session.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"content": {"type": "string"}},
-            "required": ["content"],
-        },
-    },
-    {
-        "name": "read_file",
-        "description": "Read the contents of a file.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"file_path": {"type": "string"}},
-            "required": ["file_path"],
-        },
-    },
-    {
-        "name": "list_dir",
-        "description": "List the contents of a directory.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"dir_path": {"type": "string"}},
-            "required": ["dir_path"],
-        },
-    },
-    {
-        "name": "ask_project_agent",
-        "description": (
-            "Send a question or instruction directly to a project's engineer and get their response "
-            "back immediately. Use this for back-and-forth conversation, code review requests, "
-            "quick questions about the codebase, or any task where you need an answer now."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "project_id": {"type": "string", "description": "Which project's engineer to ask"},
-                "message":    {"type": "string", "description": "Your question or instruction"},
-            },
-            "required": ["project_id", "message"],
-        },
-    },
-    {
-        "name": "cleanup_project_tasks",
-        "description": "Delete all completed (done) tasks from a project's DB. Only call after the user explicitly confirms.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"project_id": {"type": "string"}},
-            "required": ["project_id"],
-        },
-    },
-]
-
-# ── PM Tool execution ─────────────────────────────────────────
-
-def _load_projects() -> list:
-    if not os.path.exists(PROJECTS_PATH):
-        return []
-    with open(PROJECTS_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def _get_project_db_path(project_id: str):
-    project = next((p for p in _load_projects() if p["id"] == project_id), None)
-    return project.get("db_path") if project else None
-
-def _ensure_project_db(db_path: str):
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            id           TEXT PRIMARY KEY,
-            from_project TEXT NOT NULL,
-            description  TEXT NOT NULL,
-            status       TEXT DEFAULT 'pending',
-            result       TEXT,
-            created_at   TEXT,
-            updated_at   TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id         TEXT PRIMARY KEY,
-            type       TEXT NOT NULL,
-            content    TEXT NOT NULL,
-            status     TEXT DEFAULT 'unprocessed',
-            created_at TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS approvals (
-            id           TEXT PRIMARY KEY,
-            file_path    TEXT NOT NULL,
-            new_content  TEXT NOT NULL,
-            description  TEXT,
-            status       TEXT DEFAULT 'pending',
-            created_at   TEXT,
-            updated_at   TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def execute_pm_tool(name: str, tool_input: dict) -> str:
-    try:
-        if name == "get_projects":
-            return json.dumps(_load_projects())
-
-        elif name == "get_all_status":
-            conn = sqlite3.connect(DB_PATH)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute("SELECT * FROM tasks ORDER BY created_at DESC").fetchall()
-            conn.close()
-            return json.dumps([dict(r) for r in rows])
-
-        elif name == "create_project_task":
-            project_id   = tool_input["project_id"]
-            from_project = tool_input["from_project"]
-            description  = tool_input["description"]
-            db_path = _get_project_db_path(project_id)
-            if not db_path:
-                return json.dumps({"error": f"Project not found: {project_id}"})
-            _ensure_project_db(db_path)
-            task_id = str(uuid.uuid4())[:8]
-            now = datetime.now().isoformat()
-            conn = sqlite3.connect(db_path)
-            conn.execute(
-                "INSERT INTO tasks VALUES (?,?,?,?,?,?,?)",
-                (task_id, from_project, description, "pending", None, now, now),
-            )
-            conn.commit()
-            conn.close()
-            # Mirror into central DB so PM has full view
-            conn2 = sqlite3.connect(DB_PATH)
-            conn2.execute(
-                "INSERT OR IGNORE INTO tasks VALUES (?,?,?,?,?,?,?,?)",
-                (task_id, "PM", project_id, description, "pending", None, now, now),
-            )
-            conn2.commit()
-            conn2.close()
-            return json.dumps({"task_id": task_id, "status": "created"})
-
-        elif name == "get_project_tasks":
-            project_id = tool_input["project_id"]
-            db_path = _get_project_db_path(project_id)
-            if not db_path or not os.path.exists(db_path):
-                return json.dumps([])
-            conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT * FROM tasks WHERE status='pending' ORDER BY created_at ASC"
-            ).fetchall()
-            conn.close()
-            return json.dumps([dict(r) for r in rows])
-
-        elif name == "complete_project_task":
-            project_id = tool_input["project_id"]
-            task_id    = tool_input["task_id"]
-            result     = tool_input["result"]
-            db_path = _get_project_db_path(project_id)
-            if not db_path:
-                return json.dumps({"error": f"Project not found: {project_id}"})
-            now = datetime.now().isoformat()
-            conn = sqlite3.connect(db_path)
-            conn.execute(
-                "UPDATE tasks SET status='done', result=?, updated_at=? WHERE id=?",
-                (result, now, task_id),
-            )
-            conn.commit()
-            conn.close()
-            return json.dumps({"task_id": task_id, "status": "done"})
-
-        elif name == "wake_project_agent":
-            project_id = tool_input["project_id"]
-            projects   = _load_projects()
-            project    = next((p for p in projects if p["id"] == project_id), None)
-            if not project:
-                return json.dumps({"error": f"Project not found: {project_id}"})
-            project_path   = project.get("path", "")
-            db_path        = project.get("db_path", "")
-            claude_md_path = project.get("claude_md", os.path.join(project_path, "CLAUDE.md"))
-            sys_prompt = self._engineer_system_prompt(project) if hasattr(self, '_engineer_system_prompt') else ""
-            prompt = (
-                f"You have been woken up by the PM to process pending tasks.\n"
-                f"Read {claude_md_path} for project conventions, then check your task queue.\n\n"
-                f"To read your pending tasks, run:\n"
-                f"```bash\n"
-                f'python -c "import sqlite3; conn = sqlite3.connect(r\'{db_path}\'); rows = conn.execute(\'SELECT id, description FROM tasks WHERE status=\\\"pending\\\"\').fetchall(); [print(f\\\"Task {{r[0]}}: {{r[1]}}\\\") for r in rows]; conn.close()"\n'
-                f"```\n\n"
-                f"Process each task. Remember: you CANNOT write files directly — use the approval system described in your system prompt.\n"
-            )
-            subprocess.Popen(
-                ["claude", "-p", prompt, "--output-format", "stream-json",
-                 "--verbose", "--dangerously-skip-permissions",
-                 "--allowedTools", "Read,Glob,Grep,Bash",
-                 "--system-prompt", sys_prompt],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                cwd=project_path,
-            )
-            return json.dumps({"status": "woken", "project": project_id})
-
-        elif name == "write_pm_feed":
-            summary    = tool_input["summary"]
-            project_id = tool_input.get("project_id")
-            event_type = tool_input.get("event_type", "info")
-            feed_id    = str(uuid.uuid4())[:8]
-            now        = datetime.now().isoformat()
-            conn = sqlite3.connect(DB_PATH)
-            conn.execute(
-                "INSERT INTO pm_feed VALUES (?,?,?,?,?)",
-                (feed_id, project_id, event_type, summary, now),
-            )
-            conn.commit()
-            conn.close()
-            return json.dumps({"feed_id": feed_id, "status": "written"})
-
-        elif name == "save_pm_memory":
-            with open(PM_MEMORY_PATH, "w", encoding="utf-8") as f:
-                f.write(tool_input["content"])
-            return json.dumps({"status": "saved"})
-
-        elif name == "read_file":
-            file_path = tool_input["file_path"]
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    return json.dumps({"file_path": file_path, "content": f.read()})
-            except FileNotFoundError:
-                return json.dumps({"error": f"File not found: {file_path}"})
-
-        elif name == "list_dir":
-            dir_path = tool_input["dir_path"]
-            try:
-                entries = sorted(os.listdir(dir_path))
-                result  = [
-                    {"name": e, "type": "dir" if os.path.isdir(os.path.join(dir_path, e)) else "file"}
-                    for e in entries
-                ]
-                return json.dumps({"dir_path": dir_path, "entries": result})
-            except FileNotFoundError:
-                return json.dumps({"error": f"Directory not found: {dir_path}"})
-
-        elif name == "ask_project_agent":
-            project_id = tool_input["project_id"]
-            message    = tool_input["message"]
-            projects   = _load_projects()
-            project    = next((p for p in projects if p["id"] == project_id), None)
-            if not project:
-                return json.dumps({"error": f"Project not found: {project_id}"})
-            project_path   = project.get("path", "")
-            claude_md_path = project.get("claude_md", os.path.join(project_path, "CLAUDE.md"))
-            sys_prompt = self._engineer_system_prompt(project) if hasattr(self, '_engineer_system_prompt') else ""
-            prompt = (
-                f"The Project Manager is asking you:\n\n{message}\n\n"
-                f"Respond clearly and concisely. Use Read, Glob, Grep as needed to answer accurately.\n"
-                f"If the PM asks you to change files, use the approval system described in your system prompt."
-            )
-            try:
-                result = subprocess.run(
-                    ["claude", "-p", prompt, "--dangerously-skip-permissions",
-                     "--allowedTools", "Read,Glob,Grep,Bash",
-                     "--system-prompt", sys_prompt],
-                    capture_output=True, text=True, encoding="utf-8",
-                    cwd=project_path, timeout=120,
-                )
-                response = result.stdout.strip() or result.stderr.strip() or "(no response)"
-                return json.dumps({"engineer_response": response})
-            except subprocess.TimeoutExpired:
-                return json.dumps({"error": "Engineer did not respond within 120 seconds"})
-
-        elif name == "cleanup_project_tasks":
-            project_id = tool_input["project_id"]
-            db_path = _get_project_db_path(project_id)
-            if not db_path or not os.path.exists(db_path):
-                return json.dumps({"error": f"No DB found for project: {project_id}"})
-            conn = sqlite3.connect(db_path)
-            result = conn.execute("DELETE FROM tasks WHERE status='done'")
-            deleted = result.rowcount
-            conn.commit()
-            conn.close()
-            return json.dumps({"deleted": deleted, "project_id": project_id})
-
-        else:
-            return json.dumps({"error": f"Unknown tool: {name}"})
-
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-# ── Persistence helpers ───────────────────────────────────────
-
-def load_projects():
-    return _load_projects()
-
-def save_projects(projects):
-    with open(PROJECTS_PATH, "w", encoding="utf-8") as f:
-        json.dump(projects, f, indent=2)
-
-def load_conversation():
-    if not os.path.exists(CONVERSATION_PATH):
-        return []
-    with open(CONVERSATION_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_conversation(messages):
-    with open(CONVERSATION_PATH, "w", encoding="utf-8") as f:
-        json.dump(messages, f, indent=2)
-
-def load_env() -> dict:
-    result = {}
-    if not os.path.exists(TELEGRAM_ENV_PATH):
-        return result
-    with open(TELEGRAM_ENV_PATH, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                k, _, v = line.partition("=")
-                result[k.strip()] = v.strip()
-    return result
-
-def save_env(data: dict):
-    os.makedirs(os.path.dirname(TELEGRAM_ENV_PATH), exist_ok=True)
-    with open(TELEGRAM_ENV_PATH, "w", encoding="utf-8") as f:
-        for k, v in data.items():
-            f.write(f"{k}={v}\n")
-
-# ── SQLite helpers ────────────────────────────────────────────
-
-def get_pending_writes():
-    if not os.path.exists(DB_PATH):
-        return []
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT * FROM pending_writes WHERE status='pending' ORDER BY created_at ASC"
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-def resolve_write_db(write_id: str, approved: bool):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE pending_writes SET status=? WHERE id=?",
-                 ("approved" if approved else "rejected", write_id))
-    conn.commit()
-    conn.close()
-    if approved:
-        conn2 = sqlite3.connect(DB_PATH)
-        conn2.row_factory = sqlite3.Row
-        row = conn2.execute("SELECT * FROM pending_writes WHERE id=?", (write_id,)).fetchone()
-        conn2.close()
-        if row:
-            os.makedirs(os.path.dirname(row["file_path"]), exist_ok=True)
-            with open(row["file_path"], "w", encoding="utf-8") as f:
-                f.write(row["new_content"])
-
-def get_feed_since(since_id: str = None):
-    if not os.path.exists(DB_PATH):
-        return []
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    if since_id:
-        rows = conn.execute(
-            "SELECT * FROM pm_feed WHERE rowid > "
-            "(SELECT rowid FROM pm_feed WHERE id=?) ORDER BY created_at ASC",
-            (since_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM pm_feed ORDER BY created_at DESC LIMIT 50"
-        ).fetchall()
-    conn.close()
-    return [dict(r) for r in reversed(rows)] if not since_id else [dict(r) for r in rows]
-
-# ── Main UI ───────────────────────────────────────────────────
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Agent System")
         self.geometry("1400x820")
-        self.configure(bg="#1e1e2e")
+        self.configure(bg=BG_PRIMARY)
         self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -503,7 +57,6 @@ class App(tk.Tk):
 
         self._build_ui()
 
-        # Pre-fill API key from .env if present
         env = load_env()
         if env.get("ANTHROPIC_API_KEY"):
             self._api_key_var.set(env["ANTHROPIC_API_KEY"])
@@ -515,6 +68,8 @@ class App(tk.Tk):
         self._poll_bot_status()
         self._sync_project_agents()
 
+    # ── API message building ─────────────────────────────────
+
     def _build_api_messages(self) -> list:
         msgs = []
         for m in load_conversation():
@@ -522,29 +77,55 @@ class App(tk.Tk):
                 msgs.append({"role": m["role"], "content": m["content"]})
         return msgs
 
-    def _load_pm_system_prompt(self) -> str:
-        parts = []
-        if os.path.exists(PM_INSTRUCTIONS_PATH):
-            with open(PM_INSTRUCTIONS_PATH, "r", encoding="utf-8") as f:
-                parts.append(f.read().strip())
-        if os.path.exists(PM_MEMORY_PATH):
-            memory = open(PM_MEMORY_PATH, "r", encoding="utf-8").read().strip()
-            if memory:
-                parts.append(f"## Your memory from previous sessions\n\n{memory}")
-        return "\n\n---\n\n".join(parts) if parts else ""
-
     def _on_close(self):
         self.registry.kill_all()
         self._stop_bot()
         self.destroy()
 
-    # ── Settings / bot management ─────────────────────────────
+    # ── UI construction ──────────────────────────────────────
+
+    def _build_ui(self):
+        # Top bar
+        top_bar = tk.Frame(self, bg=BG_SECONDARY, pady=6)
+        top_bar.pack(fill=tk.X, padx=8, pady=(8, 0))
+        self._api_key_var = tk.StringVar()
+        self._pm_status_label = tk.Label(top_bar, text="\u25cf idle", bg=BG_SECONDARY,
+                                          fg=FG_GREEN, font=FONT_MONO)
+        self._pm_status_label.pack(side=tk.LEFT, padx=16)
+
+        self._bot_status_label = tk.Label(top_bar, text="\u25cb Bot: stopped", bg=BG_SECONDARY,
+                                           fg=FG_DIM, font=FONT_MONO)
+        self._bot_status_label.pack(side=tk.LEFT, padx=8)
+
+        tk.Button(top_bar, text="\u2699 Settings", command=self._open_settings,
+                  **BTN_MUTED).pack(side=tk.RIGHT, padx=8)
+
+        # Main PanedWindow with 4 resizable/detachable panels
+        paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg=BG_SASH,
+                               sashwidth=5, sashrelief=tk.FLAT)
+        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        self.panel_mgr = PanelManager(self, paned)
+
+        self.panel_mgr.add("agents", "Agents & Projects",
+                           lambda p: build_agents_panel(p, self),
+                           width=230, minsize=180)
+        self.panel_mgr.add("chat", "Chat",
+                           lambda p: build_chat_panel(p, self),
+                           minsize=300, stretch="always")
+        self.panel_mgr.add("feed", "Live Feed",
+                           lambda p: build_feed_panel(p, self),
+                           minsize=200, width=300)
+        self.panel_mgr.add("approvals", "Pending File Changes",
+                           lambda p: build_approvals_panel(p, self),
+                           minsize=180, width=280)
+
+    # ── Settings / bot management ────────────────────────────
 
     def _open_settings(self):
         SettingsDialog(self)
 
     def _check_bot_conflict(self, token: str) -> bool:
-        """Returns True if another bot instance is already polling Telegram."""
         import urllib.request
         import urllib.error
         try:
@@ -590,236 +171,58 @@ class App(tk.Tk):
     def _poll_bot_status(self):
         if self._bot_process is not None:
             if self._bot_process.poll() is None:
-                self._bot_status_label.config(text="● Bot: running", fg="#a6e3a1")
+                self._bot_status_label.config(text="\u25cf Bot: running", fg=FG_GREEN)
             else:
                 self._bot_process = None
-                self._bot_status_label.config(text="○ Bot: stopped", fg="#6c7086")
+                self._bot_status_label.config(text="\u25cb Bot: stopped", fg=FG_DIM)
         self.after(2000, self._poll_bot_status)
 
-    # ── UI construction ───────────────────────────────────────
-
-    def _build_ui(self):
-        top_bar = tk.Frame(self, bg="#181825", pady=6)
-        top_bar.pack(fill=tk.X, padx=8, pady=(8, 0))
-        self._api_key_var = tk.StringVar()
-        self._pm_status_label = tk.Label(top_bar, text="● idle", bg="#181825",
-                                          fg="#a6e3a1", font=("Consolas", 10))
-        self._pm_status_label.pack(side=tk.LEFT, padx=16)
-
-        self._bot_status_label = tk.Label(top_bar, text="○ Bot: stopped", bg="#181825",
-                                           fg="#6c7086", font=("Consolas", 10))
-        self._bot_status_label.pack(side=tk.LEFT, padx=8)
-
-        tk.Button(top_bar, text="⚙ Settings", command=self._open_settings,
-                  bg="#45475a", fg="#cdd6f4", relief=tk.FLAT,
-                  font=("Consolas", 10), padx=8).pack(side=tk.RIGHT, padx=8)
-
-        main = tk.Frame(self, bg="#1e1e2e")
-        main.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        main.columnconfigure(1, weight=2)
-        main.columnconfigure(2, weight=2)
-        main.rowconfigure(0, weight=1)
-
-        left = tk.Frame(main, bg="#181825", width=230)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        left.grid_propagate(False)
-        self._build_left_panel(left)
-
-        mid = tk.Frame(main, bg="#1e1e2e")
-        mid.grid(row=0, column=1, sticky="nsew", padx=(0, 6))
-        self._build_chat_panel(mid)
-
-        right = tk.Frame(main, bg="#1e1e2e")
-        right.grid(row=0, column=2, sticky="nsew")
-        self._build_right_panel(right)
-
-    def _build_left_panel(self, parent):
-        tk.Label(parent, text="Agents", bg="#181825", fg="#89b4fa",
-                 font=("Consolas", 11, "bold")).pack(anchor=tk.W, padx=10, pady=(10, 4))
-
-        self.agents_frame = tk.Frame(parent, bg="#181825")
-        self.agents_frame.pack(fill=tk.X, padx=6)
-
-        pm_row = tk.Frame(self.agents_frame, bg="#2a2a3e", cursor="hand2")
-        pm_row.pack(fill=tk.X, pady=2)
-        pm_row.bind("<Button-1>", lambda e: self._switch_agent("PM"))
-        self._pm_dot = tk.Label(pm_row, text="●", bg="#2a2a3e", fg="#a6e3a1",
-                                font=("Consolas", 12), cursor="hand2")
-        self._pm_dot.pack(side=tk.LEFT, padx=(0, 4))
-        self._pm_dot.bind("<Button-1>", lambda e: self._switch_agent("PM"))
-        pm_label = tk.Label(pm_row, text="Project Manager", bg="#2a2a3e", fg="#cdd6f4",
-                 font=("Consolas", 10), cursor="hand2")
-        pm_label.pack(side=tk.LEFT)
-        pm_label.bind("<Button-1>", lambda e: self._switch_agent("PM"))
-        tk.Label(pm_row, text="[API]", bg="#2a2a3e", fg="#6c7086",
-                 font=("Consolas", 9)).pack(side=tk.LEFT, padx=4)
-        self._agent_rows["PM"] = {"dot": self._pm_dot, "label": pm_label, "row": pm_row}
-
-        tk.Frame(parent, bg="#313244", height=1).pack(fill=tk.X, padx=6, pady=8)
-
-        tk.Label(parent, text="Projects", bg="#181825", fg="#89b4fa",
-                 font=("Consolas", 11, "bold")).pack(anchor=tk.W, padx=10, pady=(0, 4))
-
-        list_frame = tk.Frame(parent, bg="#181825")
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=6)
-
-        sb = tk.Scrollbar(list_frame, bg="#313244")
-        self.project_list = tk.Listbox(
-            list_frame, yscrollcommand=sb.set,
-            bg="#313244", fg="#cdd6f4", selectbackground="#89b4fa",
-            selectforeground="#1e1e2e", relief=tk.FLAT,
-            font=("Consolas", 10), activestyle="none", bd=0,
-        )
-        sb.config(command=self.project_list.yview)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.project_list.pack(fill=tk.BOTH, expand=True)
-
-        btn_frame = tk.Frame(parent, bg="#181825")
-        btn_frame.pack(fill=tk.X, padx=6, pady=6)
-        for text, cmd in [("+ Add", self._add_project),
-                          ("Edit",  self._edit_project),
-                          ("Delete", self._delete_project)]:
-            tk.Button(btn_frame, text=text, command=cmd,
-                      bg="#45475a", fg="#cdd6f4", relief=tk.FLAT,
-                      font=("Consolas", 9), padx=4).pack(side=tk.LEFT, padx=2)
-
-        self._refresh_project_list()
-
-    def _add_agent_row(self, agent_id: str, display_name: str):
-        if agent_id in self._agent_rows:
-            return
-        row = tk.Frame(self.agents_frame, bg="#181825", cursor="hand2")
-        row.pack(fill=tk.X, pady=2)
-        row.bind("<Button-1>", lambda e, aid=agent_id: self._switch_agent(aid))
-
-        dot = tk.Label(row, text="○", bg="#181825", fg="#6c7086",
-                       font=("Consolas", 12), cursor="hand2")
-        dot.pack(side=tk.LEFT, padx=(0, 4))
-        dot.bind("<Button-1>", lambda e, aid=agent_id: self._switch_agent(aid))
-
-        label = tk.Label(row, text=display_name, bg="#181825", fg="#cdd6f4",
-                         font=("Consolas", 10), cursor="hand2")
-        label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        label.bind("<Button-1>", lambda e, aid=agent_id: self._switch_agent(aid))
-
-        btn_frame = tk.Frame(row, bg="#181825")
-        btn_frame.pack(side=tk.RIGHT)
-        tk.Button(btn_frame, text="Wake",
-                  command=lambda aid=agent_id: self._wake_agent(aid),
-                  bg="#313244", fg="#a6e3a1", relief=tk.FLAT,
-                  font=("Consolas", 9), padx=4).pack(side=tk.LEFT, padx=1)
-        tk.Button(btn_frame, text="Kill",
-                  command=lambda aid=agent_id: self._kill_agent(aid),
-                  bg="#313244", fg="#f38ba8", relief=tk.FLAT,
-                  font=("Consolas", 9), padx=4).pack(side=tk.LEFT, padx=1)
-        self._agent_rows[agent_id] = {"dot": dot, "label": label, "row": row}
-
-    def _build_chat_panel(self, parent):
-        self._chat_title = tk.Label(parent, text="Chat — Project Manager", bg="#1e1e2e",
-                                    fg="#89b4fa", font=("Consolas", 11, "bold"))
-        self._chat_title.pack(anchor=tk.W, pady=(0, 4))
-
-        chat_frame = tk.Frame(parent, bg="#1e1e2e")
-        chat_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.chat_box = tk.Text(
-            chat_frame, bg="#1e1e2e", fg="#cdd6f4", relief=tk.FLAT,
-            font=("Consolas", 11), state=tk.DISABLED, wrap=tk.WORD,
-            padx=10, pady=10,
-        )
-        chat_scroll = tk.Scrollbar(chat_frame, command=self.chat_box.yview, bg="#313244")
-        self.chat_box.configure(yscrollcommand=chat_scroll.set)
-        chat_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.chat_box.pack(fill=tk.BOTH, expand=True)
-
-        self.chat_box.tag_config("user",  foreground="#89b4fa", font=("Consolas", 11, "bold"))
-        self.chat_box.tag_config("pm",    foreground="#a6e3a1", font=("Consolas", 11))
-        self.chat_box.tag_config("tool",  foreground="#f9e2af", font=("Consolas", 10, "italic"))
-        self.chat_box.tag_config("error", foreground="#f38ba8", font=("Consolas", 11, "bold"))
-
-        input_frame = tk.Frame(parent, bg="#181825", pady=6)
-        input_frame.pack(fill=tk.X)
-        self.input_var = tk.StringVar()
-        entry = tk.Entry(input_frame, textvariable=self.input_var,
-                         bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4",
-                         relief=tk.FLAT, font=("Consolas", 12))
-        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 6), ipady=6)
-        entry.bind("<Return>", lambda e: self._send_message())
-        tk.Button(input_frame, text="Send", command=self._send_message,
-                  bg="#89b4fa", fg="#1e1e2e", relief=tk.FLAT,
-                  font=("Consolas", 11, "bold"), padx=14).pack(side=tk.RIGHT, padx=(0, 10))
-        tk.Button(input_frame, text="Clear", command=self._clear_history,
-                  bg="#45475a", fg="#cdd6f4", relief=tk.FLAT,
-                  font=("Consolas", 10), padx=8).pack(side=tk.RIGHT, padx=(0, 4))
-
-    def _build_right_panel(self, parent):
-        tk.Label(parent, text="Live Feed", bg="#1e1e2e", fg="#f9e2af",
-                 font=("Consolas", 11, "bold")).pack(anchor=tk.W, pady=(0, 4))
-
-        feed_frame = tk.Frame(parent, bg="#1e1e2e")
-        feed_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.feed_box = tk.Text(
-            feed_frame, bg="#181825", fg="#cdd6f4", relief=tk.FLAT,
-            font=("Consolas", 10), state=tk.DISABLED, wrap=tk.WORD,
-            padx=8, pady=6,
-        )
-        feed_scroll = tk.Scrollbar(feed_frame, command=self.feed_box.yview, bg="#313244")
-        self.feed_box.configure(yscrollcommand=feed_scroll.set)
-        feed_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.feed_box.pack(fill=tk.BOTH, expand=True)
-
-        self.feed_box.tag_config("time",         foreground="#6c7086", font=("Consolas", 9))
-        self.feed_box.tag_config("project",      foreground="#89b4fa", font=("Consolas", 10, "bold"))
-        self.feed_box.tag_config("task_created", foreground="#a6e3a1")
-        self.feed_box.tag_config("task_done",    foreground="#a6e3a1", font=("Consolas", 10, "bold"))
-        self.feed_box.tag_config("bug",          foreground="#f38ba8")
-        self.feed_box.tag_config("question",     foreground="#f9e2af")
-        self.feed_box.tag_config("info",         foreground="#cdd6f4")
-
-        tk.Label(parent, text="Pending File Changes", bg="#1e1e2e", fg="#f9e2af",
-                 font=("Consolas", 11, "bold")).pack(anchor=tk.W, pady=(8, 4))
-
-        # Compact list of pending approvals
-        approvals_outer = tk.Frame(parent, bg="#1e1e2e", height=150)
-        approvals_outer.pack(fill=tk.X)
-        approvals_outer.pack_propagate(False)
-
-        self.approvals_list = tk.Listbox(
-            approvals_outer, bg="#181825", fg="#cdd6f4", relief=tk.FLAT,
-            font=("Consolas", 10), selectbackground="#313244",
-            selectforeground="#f9e2af", activestyle="none",
-            borderwidth=0, highlightthickness=0,
-        )
-        approvals_sy = tk.Scrollbar(approvals_outer, command=self.approvals_list.yview, bg="#313244")
-        self.approvals_list.configure(yscrollcommand=approvals_sy.set)
-        approvals_sy.pack(side=tk.RIGHT, fill=tk.Y)
-        self.approvals_list.pack(fill=tk.BOTH, expand=True)
-        self.approvals_list.bind("<Double-1>", self._open_review_window)
-        self._pending_items = []  # stores the actual approval dicts
-
-        self.diff_status = tk.Label(parent, text="No pending changes — double-click to review",
-                                    bg="#1e1e2e", fg="#6c7086", font=("Consolas", 10))
-        self.diff_status.pack(anchor=tk.W, pady=(4, 0))
-
-    # ── Agent controls ────────────────────────────────────────
+    # ── Agent controls ───────────────────────────────────────
 
     def _switch_agent(self, agent_id: str):
         self._active_agent_id = agent_id
-        # Update highlight
         for aid, widgets in self._agent_rows.items():
-            bg = "#2a2a3e" if aid == agent_id else "#181825"
+            from theme import BG_HIGHLIGHT
+            bg = BG_HIGHLIGHT if aid == agent_id else BG_SECONDARY
             widgets["row"].config(bg=bg)
             widgets["dot"].config(bg=bg)
             widgets["label"].config(bg=bg)
-        # Update chat title
         if agent_id == "PM":
             name = "Project Manager"
         else:
             projects = load_projects()
             p = next((p for p in projects if p["id"] == agent_id), None)
             name = p["name"] if p else agent_id
-        self._chat_title.config(text=f"Chat — {name}")
+        self._chat_title.config(text=f"Chat \u2014 {name}")
+
+    def _add_agent_row(self, agent_id: str, display_name: str):
+        if agent_id in self._agent_rows:
+            return
+        row = tk.Frame(self.agents_frame, bg=BG_SECONDARY, cursor="hand2")
+        row.pack(fill=tk.X, pady=2)
+        row.bind("<Button-1>", lambda e, aid=agent_id: self._switch_agent(aid))
+
+        dot = tk.Label(row, text="\u25cb", bg=BG_SECONDARY, fg=FG_DIM,
+                       font=FONT_MONO_LG, cursor="hand2")
+        dot.pack(side=tk.LEFT, padx=(0, 4))
+        dot.bind("<Button-1>", lambda e, aid=agent_id: self._switch_agent(aid))
+
+        label = tk.Label(row, text=display_name, bg=BG_SECONDARY, fg=FG_PRIMARY,
+                         font=FONT_MONO, cursor="hand2")
+        label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        label.bind("<Button-1>", lambda e, aid=agent_id: self._switch_agent(aid))
+
+        btn_frame = tk.Frame(row, bg=BG_SECONDARY)
+        btn_frame.pack(side=tk.RIGHT)
+        tk.Button(btn_frame, text="Wake",
+                  command=lambda aid=agent_id: self._wake_agent(aid),
+                  bg=BG_SURFACE, fg=FG_GREEN, relief=tk.FLAT,
+                  font=FONT_MONO_SM, padx=4).pack(side=tk.LEFT, padx=1)
+        tk.Button(btn_frame, text="Kill",
+                  command=lambda aid=agent_id: self._kill_agent(aid),
+                  bg=BG_SURFACE, fg=FG_RED, relief=tk.FLAT,
+                  font=FONT_MONO_SM, padx=4).pack(side=tk.LEFT, padx=1)
+        self._agent_rows[agent_id] = {"dot": dot, "label": label, "row": row}
 
     def _wake_agent(self, agent_id: str):
         agent = self.registry.get(agent_id)
@@ -838,87 +241,32 @@ class App(tk.Tk):
                 continue
             dot = widgets["dot"]
             if agent.status == THINKING:
-                dot.config(text="◌", fg="#f9e2af")
-                widgets["label"].config(fg="#f9e2af")
+                dot.config(text="\u25cc", fg=FG_YELLOW)
+                widgets["label"].config(fg=FG_YELLOW)
             elif agent.status == IDLE:
-                dot.config(text="●", fg="#a6e3a1")
-                widgets["label"].config(fg="#cdd6f4")
+                dot.config(text="\u25cf", fg=FG_GREEN)
+                widgets["label"].config(fg=FG_PRIMARY)
             else:
-                dot.config(text="○", fg="#6c7086")
-                widgets["label"].config(fg="#6c7086")
+                dot.config(text="\u25cb", fg=FG_DIM)
+                widgets["label"].config(fg=FG_DIM)
         self.after(1000, self._poll_agent_status)
-
-    def _engineer_system_prompt(self, project: dict) -> str:
-        base = ""
-        claude_md = project.get("claude_md", "")
-        if claude_md and os.path.exists(claude_md):
-            with open(claude_md, "r", encoding="utf-8") as f:
-                base = f.read().strip() + "\n\n"
-        project_id = project.get("id", "unknown")
-        project_path = project.get("path", "")
-        db_path = project.get("db_path", "")
-        rules = (
-            f"## Your identity\n"
-            f"You are an engineer for project '{project_id}' at {project_path}.\n\n"
-            f"## Your tools\n"
-            f"Use only native tools: Read, Glob, Grep, Bash.\n"
-            f"You have NO access to any MCP server — do not attempt to call MCP tools.\n"
-            f"You do NOT have direct write permissions — all file writes must go through the approval system below.\n\n"
-            f"## Task queue\n"
-            f"The PM will inject your pending tasks directly into the conversation.\n"
-            f"Each task will have an ID — implement it using your tools.\n\n"
-            f"## How to write files (approval required)\n"
-            f"You CANNOT write files directly. You MUST run the Bash commands below — do not describe them, do not skip them, actually execute them.\n"
-            f"IMPORTANT: Do NOT ask the user for confirmation before submitting. Just submit the approval request immediately.\n"
-            f"The user will approve or reject through the UI — never ask 'should I go ahead?' or 'want me to make this edit?'.\n\n"
-            f"1. EXECUTE this Bash command to submit the request (replace placeholders):\n"
-            f"```bash\n"
-            f'python -c "\nimport sqlite3, uuid, datetime\n'
-            f'conn = sqlite3.connect(r\'{db_path}\')\n'
-            f'aid = str(uuid.uuid4())[:8]\n'
-            f'now = datetime.datetime.now().isoformat()\n'
-            f'conn.execute(\'INSERT INTO approvals VALUES (?,?,?,?,?,?,?)\', [aid, \'<file_path>\', \'<new_content>\', \'<description>\', \'pending\', now, now])\n'
-            f'conn.commit()\n'
-            f'print(aid)\n'
-            f'conn.close()\n'
-            f'"\n'
-            f"```\n\n"
-            f"2. Poll until approved or rejected:\n"
-            f"```bash\n"
-            f'python -c "\nimport sqlite3, time\n'
-            f'conn = sqlite3.connect(r\'{db_path}\')\n'
-            f'while True:\n'
-            f'    row = conn.execute(\'SELECT status FROM approvals WHERE id=?\', [\'<approval_id>\']).fetchone()\n'
-            f'    if row and row[0] != \'pending\': print(row[0]); break\n'
-            f'    time.sleep(2)\n'
-            f'conn.close()\n'
-            f'"\n'
-            f"```\n\n"
-            f"3. If approved, the UI writes the file. If rejected, adjust and resubmit.\n\n"
-            f"## Marking tasks done\n"
-            f"When all file changes are approved and the task is complete:\n"
-            f"```bash\n"
-            f'python -c "import sqlite3, datetime; conn = sqlite3.connect(r\'{db_path}\'); conn.execute(\'UPDATE tasks SET status=\\\"done\\\", result=?, updated_at=? WHERE id=?\', [\'done - waiting for PM approval: <summary>\', datetime.datetime.now().isoformat(), \'<task_id>\']); conn.commit(); conn.close()"\n'
-            f"```\n"
-        )
-        return base + rules
 
     def _sync_project_agents(self):
         for p in load_projects():
             agent_id = p["id"]
             db_path = p.get("db_path")
             if db_path:
-                _ensure_project_db(db_path)
+                ensure_project_db(db_path)
             if agent_id not in self._agent_rows:
                 self.registry.get_or_create(
                     agent_id, p["name"], p.get("path", REPO_DIR),
-                    system_prompt=self._engineer_system_prompt(p),
+                    system_prompt=engineer_system_prompt(p),
                 )
                 self._add_agent_row(agent_id, p["name"])
                 self.registry.get(agent_id).start()
         self.after(5000, self._sync_project_agents)
 
-    # ── Project management ────────────────────────────────────
+    # ── Project management ───────────────────────────────────
 
     def _refresh_project_list(self):
         self.project_list.delete(0, tk.END)
@@ -935,7 +283,7 @@ class App(tk.Tk):
         self._refresh_project_list()
         self.registry.get_or_create(
             data["id"], data["name"], data.get("path", REPO_DIR),
-            system_prompt=self._engineer_system_prompt(data),
+            system_prompt=engineer_system_prompt(data),
         )
         self._add_agent_row(data["id"], data["name"])
 
@@ -964,7 +312,7 @@ class App(tk.Tk):
             save_projects(projects)
             self._refresh_project_list()
 
-    # ── Chat ──────────────────────────────────────────────────
+    # ── Chat ─────────────────────────────────────────────────
 
     def _active_agent_name(self) -> str:
         if self._active_agent_id == "PM":
@@ -1000,11 +348,11 @@ class App(tk.Tk):
     def _set_pm_thinking(self, thinking: bool):
         self._pm_thinking = thinking
         if thinking:
-            self._pm_dot.config(text="◌", fg="#f9e2af")
-            self._pm_status_label.config(text="◌ thinking", fg="#f9e2af")
+            self._pm_dot.config(text="\u25cc", fg=FG_YELLOW)
+            self._pm_status_label.config(text="\u25cc thinking", fg=FG_YELLOW)
         else:
-            self._pm_dot.config(text="●", fg="#a6e3a1")
-            self._pm_status_label.config(text="● idle", fg="#a6e3a1")
+            self._pm_dot.config(text="\u25cf", fg=FG_GREEN)
+            self._pm_status_label.config(text="\u25cf idle", fg=FG_GREEN)
 
     def _send_message(self):
         text = self.input_var.get().strip()
@@ -1021,7 +369,7 @@ class App(tk.Tk):
                 return
             api_key = self._api_key_var.get().strip()
             if not api_key or not api_key.startswith("sk-ant-"):
-                messagebox.showerror("API Key", "No valid Anthropic API key found. Add it in ⚙ Settings.")
+                messagebox.showerror("API Key", "No valid Anthropic API key found. Add it in \u2699 Settings.")
                 return
             self.input_var.set("")
             self._append_chat("user", text)
@@ -1031,7 +379,6 @@ class App(tk.Tk):
             threading.Thread(target=self._pm_api_loop, args=(text, api_key),
                              daemon=True).start()
         else:
-            # Direct chat with a project engineer
             agent = self.registry.get(self._active_agent_id)
             if not agent:
                 messagebox.showerror("Agent not found", f"No agent for {self._active_agent_id}")
@@ -1044,8 +391,7 @@ class App(tk.Tk):
             self.input_var.set("")
             self._append_chat("user", text)
             self._append_chat("pm_start", "")
-            # Inject pending tasks from DB directly into message
-            full_message = self._inject_pending_tasks(self._active_agent_id, text)
+            full_message = inject_pending_tasks(self._active_agent_id, text)
             agent.send(
                 full_message,
                 on_chunk=lambda chunk: self.after(0, self._append_chat, "pm", chunk),
@@ -1053,46 +399,10 @@ class App(tk.Tk):
                 on_error=lambda err: self.after(0, self._append_chat, "error", err),
             )
 
-    def _inject_pending_tasks(self, project_id: str, user_message: str) -> str:
-        """Prepend pending tasks from the DB into the engineer's message."""
-        try:
-            db_path = _get_project_db_path(project_id)
-            if not db_path or not os.path.exists(db_path):
-                return user_message
-            conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT * FROM tasks WHERE status='pending' ORDER BY created_at ASC"
-            ).fetchall()
-            conn.close()
-            if not rows:
-                return user_message
-            lines = [f"[PENDING TASKS FROM PM — process these if relevant:]"]
-            for r in rows:
-                lines.append(f"  - [{r['id']}] {r['description']}")
-            lines.append("")
-            return "\n".join(lines) + user_message
-        except Exception:
-            return user_message
-
-    def _trim_messages(self, msgs: list, max_count: int = 20) -> list:
-        """Trim to max_count, but never start with an orphaned tool_result block."""
-        trimmed = msgs[-max_count:]
-        while trimmed:
-            content = trimmed[0].get("content", "")
-            if isinstance(content, list) and any(
-                isinstance(b, dict) and b.get("type") == "tool_result" for b in content
-            ):
-                trimmed = trimmed[1:]
-            else:
-                break
-        return trimmed
-
     def _pm_api_loop(self, user_message: str, api_key: str):
-        """PM agentic loop — Anthropic API with inline tool execution."""
         client        = anthropic.Anthropic(api_key=api_key)
-        system_prompt = self._load_pm_system_prompt()
-        messages      = self._trim_messages(self._api_messages)
+        system_prompt = load_pm_system_prompt()
+        messages      = trim_messages(self._api_messages)
         messages.append({"role": "user", "content": user_message})
 
         try:
@@ -1111,7 +421,6 @@ class App(tk.Tk):
                         self.after(0, self._append_chat, "pm", text)
                     final = stream.get_final_message()
 
-                # Build assistant message preserving tool_use blocks
                 assistant_content = []
                 for block in final.content:
                     if block.type == "text":
@@ -1127,7 +436,6 @@ class App(tk.Tk):
 
                 tool_uses = [b for b in final.content if b.type == "tool_use"]
                 if not tool_uses:
-                    # Done — save to conversation
                     text_content = "".join(text_buf).strip()
                     if text_content:
                         self._api_messages = messages
@@ -1136,7 +444,6 @@ class App(tk.Tk):
                         save_conversation(self.conversation)
                     break
 
-                # Execute tools, show in chat
                 tool_results = []
                 for block in tool_uses:
                     self.after(0, self._append_chat, "tool", f"\n[tool: {block.name}]\n")
@@ -1165,7 +472,7 @@ class App(tk.Tk):
             self.chat_box.delete("1.0", tk.END)
             self.chat_box.configure(state=tk.DISABLED)
 
-    # ── Live feed ─────────────────────────────────────────────
+    # ── Live feed ────────────────────────────────────────────
 
     def _poll_feed(self):
         try:
@@ -1194,58 +501,14 @@ class App(tk.Tk):
         self.feed_box.configure(state=tk.DISABLED)
         self.feed_box.see(tk.END)
 
-    # ── Diff / pending writes ─────────────────────────────────
-
-    def _get_project_approvals(self) -> list:
-        """Collect pending approval requests from all project agent.db files."""
-        results = []
-        for p in load_projects():
-            db_path = p.get("db_path")
-            if not db_path or not os.path.exists(db_path):
-                continue
-            try:
-                conn = sqlite3.connect(db_path)
-                conn.row_factory = sqlite3.Row
-                rows = conn.execute(
-                    "SELECT * FROM approvals WHERE status='pending' ORDER BY created_at ASC"
-                ).fetchall()
-                conn.close()
-                results.extend([{**dict(r), "project_id": p["id"], "project_name": p["name"]} for r in rows])
-            except Exception:
-                pass
-        return results
-
-    def _resolve_project_approval(self, approval: dict, approved: bool):
-        db_path = _get_project_db_path(approval["project_id"])
-        if not db_path:
-            return
-        conn = sqlite3.connect(db_path)
-        now = datetime.now().isoformat()
-        conn.execute(
-            "UPDATE approvals SET status=?, updated_at=? WHERE id=?",
-            ("approved" if approved else "rejected", now, approval["id"])
-        )
-        conn.commit()
-        conn.close()
-        if approved:
-            file_path = approval["file_path"]
-            # If path is relative, resolve against the project's directory
-            if not os.path.isabs(file_path):
-                project = next((p for p in load_projects() if p["id"] == approval["project_id"]), None)
-                if project:
-                    file_path = os.path.join(project["path"], file_path)
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(approval["new_content"])
+    # ── Pending writes / approvals ───────────────────────────
 
     def _poll_pending_writes(self):
         try:
-            # Check MCP pending_writes first, then project approvals
             writes = get_pending_writes()
-            approvals = self._get_project_approvals()
+            approvals = get_project_approvals()
             all_pending = writes + approvals
 
-            # Build list of current pending IDs
             new_ids = [p["id"] for p in all_pending]
             old_ids = [p["id"] for p in self._pending_items]
 
@@ -1260,10 +523,10 @@ class App(tk.Tk):
 
             if all_pending:
                 self.diff_status.config(
-                    text=f"{len(all_pending)} pending change(s) — double-click to review", fg="#f9e2af")
+                    text=f"{len(all_pending)} pending change(s) \u2014 double-click to review", fg=FG_YELLOW)
             else:
                 self._pending_items = []
-                self.diff_status.config(text="No pending changes", fg="#6c7086")
+                self.diff_status.config(text="No pending changes", fg=FG_DIM)
         except Exception:
             pass
         self.after(2000, self._poll_pending_writes)
@@ -1279,300 +542,19 @@ class App(tk.Tk):
         ReviewWindow(self, item, on_resolve=self._on_review_resolved)
 
     def _on_review_resolved(self):
-        """Called after approve/reject in the review window."""
         self._current_write = None
 
     def _approve_write(self, item: dict):
         if "project_id" in item:
-            self._resolve_project_approval(item, approved=True)
+            resolve_project_approval(item, approved=True)
         else:
             resolve_write_db(item["id"], approved=True)
 
     def _reject_write(self, item: dict):
         if "project_id" in item:
-            self._resolve_project_approval(item, approved=False)
+            resolve_project_approval(item, approved=False)
         else:
             resolve_write_db(item["id"], approved=False)
-
-
-# ── Project dialog ────────────────────────────────────────────
-
-class ReviewWindow(tk.Toplevel):
-    """Popup window for reviewing a pending file change approval."""
-
-    def __init__(self, parent, approval: dict, on_resolve=None):
-        super().__init__(parent)
-        self.parent_app = parent
-        self._approval = approval
-        self._on_resolve = on_resolve
-        self.title(f"Review — {approval.get('description', 'file change')}")
-        self.configure(bg="#1e1e2e")
-        self.geometry("900x600")
-        self.grab_set()
-
-        # ── Top bar: project + description ──
-        top = tk.Frame(self, bg="#1e1e2e")
-        top.pack(fill=tk.X, padx=12, pady=(10, 4))
-        project_name = approval.get("project_name", approval.get("project_id", "?"))
-        tk.Label(top, text=f"[{project_name}]", bg="#1e1e2e", fg="#89b4fa",
-                 font=("Consolas", 12, "bold")).pack(side=tk.LEFT)
-        tk.Label(top, text=f"  {approval.get('description', '')}", bg="#1e1e2e", fg="#cdd6f4",
-                 font=("Consolas", 11)).pack(side=tk.LEFT)
-
-        # ── Main area ──
-        main = tk.Frame(self, bg="#1e1e2e")
-        main.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
-
-        # Right side: file list
-        right = tk.Frame(main, bg="#181825", width=220)
-        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
-        right.pack_propagate(False)
-        tk.Label(right, text="Files", bg="#181825", fg="#f9e2af",
-                 font=("Consolas", 10, "bold")).pack(anchor=tk.W, padx=8, pady=(6, 4))
-        file_path = approval.get("file_path", "")
-        file_name = os.path.basename(file_path)
-        self._file_label = tk.Label(right, text=f"  {file_name}", bg="#313244", fg="#a6e3a1",
-                                    font=("Consolas", 10), anchor=tk.W, padx=6, pady=4)
-        self._file_label.pack(fill=tk.X, padx=4, pady=2)
-        tk.Label(right, text=file_path, bg="#181825", fg="#6c7086",
-                 font=("Consolas", 8), wraplength=200, anchor=tk.W).pack(anchor=tk.W, padx=8, pady=(2, 0))
-
-        # Left side: diff viewer
-        diff_frame = tk.Frame(main, bg="#181825")
-        diff_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self.diff_box = tk.Text(
-            diff_frame, bg="#181825", fg="#cdd6f4", relief=tk.FLAT,
-            font=("Consolas", 10), state=tk.DISABLED, wrap=tk.NONE,
-            padx=8, pady=6,
-        )
-        diff_sy = tk.Scrollbar(diff_frame, command=self.diff_box.yview, bg="#313244")
-        diff_sx = tk.Scrollbar(diff_frame, orient=tk.HORIZONTAL,
-                               command=self.diff_box.xview, bg="#313244")
-        self.diff_box.configure(yscrollcommand=diff_sy.set, xscrollcommand=diff_sx.set)
-        diff_sy.pack(side=tk.RIGHT, fill=tk.Y)
-        diff_sx.pack(side=tk.BOTTOM, fill=tk.X)
-        self.diff_box.pack(fill=tk.BOTH, expand=True)
-
-        self.diff_box.tag_config("added",   foreground="#a6e3a1")
-        self.diff_box.tag_config("removed", foreground="#f38ba8")
-        self.diff_box.tag_config("header",  foreground="#89b4fa", font=("Consolas", 10, "bold"))
-        self.diff_box.tag_config("meta",    foreground="#f9e2af")
-
-        self._render_diff(approval)
-
-        # ── Bottom buttons ──
-        btns = tk.Frame(self, bg="#1e1e2e")
-        btns.pack(fill=tk.X, padx=12, pady=(4, 12))
-        tk.Button(btns, text="  Approve  ", command=self._approve,
-                  bg="#a6e3a1", fg="#1e1e2e", relief=tk.FLAT,
-                  font=("Consolas", 12, "bold"), padx=14).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Button(btns, text="  Reject  ", command=self._reject,
-                  bg="#f38ba8", fg="#1e1e2e", relief=tk.FLAT,
-                  font=("Consolas", 12, "bold"), padx=14).pack(side=tk.LEFT)
-
-    def _render_diff(self, approval: dict):
-        self.diff_box.configure(state=tk.NORMAL)
-        self.diff_box.delete("1.0", tk.END)
-
-        file_path = approval.get("file_path", "")
-        # Try to read the current file content for a real diff
-        original_content = approval.get("original_content", "")
-        if not original_content and file_path:
-            abs_path = file_path
-            if not os.path.isabs(abs_path):
-                project = next((p for p in load_projects() if p["id"] == approval.get("project_id")), None)
-                if project:
-                    abs_path = os.path.join(project["path"], abs_path)
-            try:
-                with open(abs_path, "r", encoding="utf-8") as f:
-                    original_content = f.read()
-            except Exception:
-                original_content = ""
-
-        original = original_content.splitlines(keepends=True)
-        new = (approval.get("new_content") or "").splitlines(keepends=True)
-
-        self.diff_box.insert(tk.END, f"File: {file_path}\n", "header")
-        self.diff_box.insert(tk.END, f"Change: {approval.get('description', '')}\n\n", "meta")
-
-        for line in difflib.unified_diff(original, new, fromfile="current",
-                                         tofile="proposed", lineterm=""):
-            if line.startswith(("+++", "---")):
-                self.diff_box.insert(tk.END, line + "\n", "header")
-            elif line.startswith("@@"):
-                self.diff_box.insert(tk.END, line + "\n", "meta")
-            elif line.startswith("+"):
-                self.diff_box.insert(tk.END, line + "\n", "added")
-            elif line.startswith("-"):
-                self.diff_box.insert(tk.END, line + "\n", "removed")
-            else:
-                self.diff_box.insert(tk.END, line + "\n")
-
-        self.diff_box.configure(state=tk.DISABLED)
-
-    def _approve(self):
-        self.parent_app._approve_write(self._approval)
-        if self._on_resolve:
-            self._on_resolve()
-        self.destroy()
-
-    def _reject(self):
-        self.parent_app._reject_write(self._approval)
-        if self._on_resolve:
-            self._on_resolve()
-        self.destroy()
-
-
-class ProjectDialog(tk.Toplevel):
-    def __init__(self, parent, title, on_save, existing=None):
-        super().__init__(parent)
-        self.title(title)
-        self.configure(bg="#1e1e2e")
-        self.resizable(False, False)
-        self.grab_set()
-        self._on_save = on_save
-
-        fields = [
-            ("id",        "ID (e.g. BE1)",          existing.get("id", "")        if existing else ""),
-            ("name",      "Name",                    existing.get("name", "")      if existing else ""),
-            ("type",      "Type (BE/FE/FULLSTACK)",  existing.get("type", "BE")    if existing else "BE"),
-            ("path",      "Project path",            existing.get("path", "")      if existing else ""),
-            ("claude_md", "CLAUDE.md path",          existing.get("claude_md", "") if existing else ""),
-            ("db_path",   "DB path (agent.db)",      existing.get("db_path", "")   if existing else ""),
-        ]
-
-        self._vars = {}
-        for key, label, default in fields:
-            row = tk.Frame(self, bg="#1e1e2e")
-            row.pack(fill=tk.X, padx=16, pady=4)
-            tk.Label(row, text=label, bg="#1e1e2e", fg="#cdd6f4",
-                     font=("Consolas", 10), width=24, anchor=tk.W).pack(side=tk.LEFT)
-            var = tk.StringVar(value=default)
-            self._vars[key] = var
-            tk.Entry(row, textvariable=var, bg="#313244", fg="#cdd6f4",
-                     insertbackground="#cdd6f4", relief=tk.FLAT,
-                     font=("Consolas", 10), width=38).pack(side=tk.LEFT, padx=4)
-
-        btn_row = tk.Frame(self, bg="#1e1e2e")
-        btn_row.pack(pady=12)
-        tk.Button(btn_row, text="Save", command=self._save,
-                  bg="#89b4fa", fg="#1e1e2e", relief=tk.FLAT,
-                  font=("Consolas", 11, "bold"), padx=14).pack(side=tk.LEFT, padx=6)
-        tk.Button(btn_row, text="Cancel", command=self.destroy,
-                  bg="#45475a", fg="#cdd6f4", relief=tk.FLAT,
-                  font=("Consolas", 10), padx=10).pack(side=tk.LEFT)
-
-    def _save(self):
-        data = {k: v.get().strip() for k, v in self._vars.items()}
-        if not data["id"] or not data["name"] or not data["path"]:
-            messagebox.showerror("Missing fields", "ID, Name and Path are required.")
-            return
-        self._on_save(data)
-        self.destroy()
-
-
-# ── Settings dialog ───────────────────────────────────────────
-
-class SettingsDialog(tk.Toplevel):
-    _FIELDS = [
-        ("ANTHROPIC_API_KEY",  "Anthropic API Key",  True),
-        ("TELEGRAM_BOT_TOKEN", "Telegram Bot Token", True),
-        ("TELEGRAM_CHAT_ID",   "Telegram Chat ID",   False),
-    ]
-
-    def __init__(self, app: "App"):
-        super().__init__(app)
-        self._app = app
-        self.title("Settings")
-        self.configure(bg="#1e1e2e")
-        self.resizable(False, False)
-        self.grab_set()
-
-        env = load_env()
-
-        tk.Label(self, text="API Keys", bg="#1e1e2e", fg="#89b4fa",
-                 font=("Consolas", 11, "bold")).pack(anchor=tk.W, padx=16, pady=(12, 4))
-
-        self._vars = {}
-        for key, label, masked in self._FIELDS:
-            row = tk.Frame(self, bg="#1e1e2e")
-            row.pack(fill=tk.X, padx=16, pady=3)
-            tk.Label(row, text=label, bg="#1e1e2e", fg="#cdd6f4",
-                     font=("Consolas", 10), width=22, anchor=tk.W).pack(side=tk.LEFT)
-            var = tk.StringVar(value=env.get(key, ""))
-            self._vars[key] = var
-            entry = tk.Entry(row, textvariable=var, show="*" if masked else "",
-                             bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4",
-                             relief=tk.FLAT, font=("Consolas", 10), width=40)
-            entry.pack(side=tk.LEFT, padx=4)
-            if masked:
-                def _make_toggle(e=entry):
-                    def _toggle():
-                        e.config(show="" if e.cget("show") == "*" else "*")
-                    return _toggle
-                tk.Button(row, text="👁", command=_make_toggle(),
-                          bg="#313244", fg="#cdd6f4", relief=tk.FLAT,
-                          font=("Consolas", 9), padx=4).pack(side=tk.LEFT)
-
-        tk.Frame(self, bg="#313244", height=1).pack(fill=tk.X, padx=16, pady=8)
-
-        tk.Label(self, text="Telegram Bot", bg="#1e1e2e", fg="#89b4fa",
-                 font=("Consolas", 11, "bold")).pack(anchor=tk.W, padx=16, pady=(0, 6))
-
-        bot_row = tk.Frame(self, bg="#1e1e2e")
-        bot_row.pack(fill=tk.X, padx=16, pady=(0, 8))
-
-        self._status_var = tk.StringVar()
-        tk.Label(bot_row, textvariable=self._status_var, bg="#1e1e2e",
-                 fg="#cdd6f4", font=("Consolas", 10), width=20, anchor=tk.W).pack(side=tk.LEFT)
-
-        self._start_btn = tk.Button(bot_row, text="Start Bot", command=self._start_bot,
-                                     bg="#a6e3a1", fg="#1e1e2e", relief=tk.FLAT,
-                                     font=("Consolas", 10, "bold"), padx=10)
-        self._start_btn.pack(side=tk.LEFT, padx=(0, 4))
-
-        self._stop_btn = tk.Button(bot_row, text="Stop Bot", command=self._stop_bot,
-                                    bg="#f38ba8", fg="#1e1e2e", relief=tk.FLAT,
-                                    font=("Consolas", 10, "bold"), padx=10)
-        self._stop_btn.pack(side=tk.LEFT)
-
-        btn_row = tk.Frame(self, bg="#1e1e2e")
-        btn_row.pack(pady=12)
-        tk.Button(btn_row, text="Save", command=self._save,
-                  bg="#89b4fa", fg="#1e1e2e", relief=tk.FLAT,
-                  font=("Consolas", 11, "bold"), padx=14).pack(side=tk.LEFT, padx=6)
-        tk.Button(btn_row, text="Cancel", command=self.destroy,
-                  bg="#45475a", fg="#cdd6f4", relief=tk.FLAT,
-                  font=("Consolas", 10), padx=10).pack(side=tk.LEFT)
-
-        self._refresh()
-
-    def _is_bot_running(self) -> bool:
-        return (self._app._bot_process is not None and
-                self._app._bot_process.poll() is None)
-
-    def _refresh(self):
-        running = self._is_bot_running()
-        self._status_var.set("● running" if running else "○ stopped")
-        self._start_btn.config(state=tk.DISABLED if running else tk.NORMAL)
-        self._stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
-        if self.winfo_exists():
-            self.after(1000, self._refresh)
-
-    def _start_bot(self):
-        self._app._start_bot()
-
-    def _stop_bot(self):
-        self._app._stop_bot()
-
-    def _save(self):
-        data = {k: v.get().strip() for k, v in self._vars.items()}
-        save_env(data)
-        if data.get("ANTHROPIC_API_KEY"):
-            self._app._api_key_var.set(data["ANTHROPIC_API_KEY"])
-        messagebox.showinfo("Saved", "Settings saved.", parent=self)
-        self.destroy()
 
 
 # ── Entry point ───────────────────────────────────────────────
