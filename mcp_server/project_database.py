@@ -38,6 +38,19 @@ def init_project_db(db_path: str):
     """)
     # Tasks assigned TO this project by the PM
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS approvals (
+            id           TEXT PRIMARY KEY,
+            file_path    TEXT NOT NULL,
+            new_content  TEXT NOT NULL,
+            description  TEXT,
+            status       TEXT DEFAULT 'pending',
+            created_at   TEXT,
+            updated_at   TEXT
+        )
+    """)
+    # File write requests from engineers awaiting user approval
+
     conn.commit()
     conn.close()
 
@@ -112,6 +125,46 @@ def get_tasks(db_path: str, status: str = "pending") -> list:
     conn.close()
     return [dict(r) for r in rows]
 
+
+def request_approval(db_path: str, file_path: str, new_content: str, description: str) -> dict:
+    conn = get_connection(db_path)
+    approval_id = str(uuid.uuid4())[:8]
+    now = datetime.now().isoformat()
+    conn.execute(
+        "INSERT INTO approvals VALUES (?,?,?,?,?,?,?)",
+        (approval_id, file_path, new_content, description, "pending", now, now)
+    )
+    conn.commit()
+    conn.close()
+    return {"approval_id": approval_id, "status": "pending"}
+
+def get_pending_approvals(db_path: str) -> list:
+    conn = get_connection(db_path)
+    rows = conn.execute(
+        "SELECT * FROM approvals WHERE status='pending' ORDER BY created_at ASC"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_approval_status(db_path: str, approval_id: str) -> dict:
+    conn = get_connection(db_path)
+    row = conn.execute(
+        "SELECT * FROM approvals WHERE id=?", (approval_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+def resolve_approval(db_path: str, approval_id: str, approved: bool) -> dict:
+    conn = get_connection(db_path)
+    status = "approved" if approved else "rejected"
+    now = datetime.now().isoformat()
+    conn.execute(
+        "UPDATE approvals SET status=?, updated_at=? WHERE id=?",
+        (status, now, approval_id)
+    )
+    conn.commit()
+    conn.close()
+    return {"approval_id": approval_id, "status": status}
 
 def complete_task(db_path: str, task_id: str, result: str) -> dict:
     conn = get_connection(db_path)

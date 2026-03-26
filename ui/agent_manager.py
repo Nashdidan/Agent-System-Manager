@@ -66,7 +66,10 @@ class AgentProcess:
                         pass
             self._proc        = None
             self._has_session = False
+            self.session_id   = None
             self.status       = DEAD
+        if self._on_session_saved:
+            self._on_session_saved(self.agent_id, None)
 
     def is_alive(self) -> bool:
         """True if ready or currently thinking (has a session or is running)."""
@@ -95,7 +98,7 @@ class AgentProcess:
     def _run(self, message: str, on_chunk, on_done, on_error):
         try:
             cmd = ["claude", "-p", message, "--output-format", "stream-json", "--verbose",
-                   "--dangerously-skip-permissions"]
+                   "--dangerously-skip-permissions", "--allowedTools", "Read,Glob,Grep,Bash"]
 
             if self.session_id:
                 cmd += ["--resume", self.session_id]
@@ -196,8 +199,11 @@ class AgentRegistry:
         self._sessions = _load_sessions()
         self._lock = threading.Lock()
 
-    def _on_session_saved(self, agent_id: str, session_id: str):
-        self._sessions[agent_id] = session_id
+    def _on_session_saved(self, agent_id: str, session_id: str | None):
+        if session_id is None:
+            self._sessions.pop(agent_id, None)
+        else:
+            self._sessions[agent_id] = session_id
         _save_sessions(self._sessions)
 
     def get_or_create(self, agent_id: str, display_name: str, cwd: str,

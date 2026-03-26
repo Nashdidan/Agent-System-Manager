@@ -208,8 +208,11 @@ __marimo__/
 
 # Agent system runtime files
 mcp_server/agent_system.db
+agent_system.db
 ui/pm_conversation.json
 ui/agent_sessions.json
 telegram_bot/.env
 agents/sapi.txt
 projects.json
+SakranelPro/
+.idea/

@@ -193,6 +193,17 @@ def _ensure_project_db(db_path: str):
             created_at TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS approvals (
+            id           TEXT PRIMARY KEY,
+            file_path    TEXT NOT NULL,
+            new_content  TEXT NOT NULL,
+            description  TEXT,
+            status       TEXT DEFAULT 'pending',
+            created_at   TEXT,
+            updated_at   TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -272,22 +283,23 @@ def execute_pm_tool(name: str, tool_input: dict) -> str:
             if not project:
                 return json.dumps({"error": f"Project not found: {project_id}"})
             project_path   = project.get("path", "")
+            db_path        = project.get("db_path", "")
             claude_md_path = project.get("claude_md", os.path.join(project_path, "CLAUDE.md"))
+            sys_prompt = self._engineer_system_prompt(project) if hasattr(self, '_engineer_system_prompt') else ""
             prompt = (
-                f"You are a software engineer working on the project at {project_path}.\n"
-                f"Use read_file('{claude_md_path}') to load project conventions before starting.\n\n"
-                f"Steps:\n"
-                f"1. Call read_file('{claude_md_path}') to understand conventions\n"
-                f"2. Call get_project_tasks('{project_id}') to see pending tasks\n"
-                f"3. Implement each task using read_file / list_dir / write_file\n"
-                f"4. When a task is done, call complete_project_task('{project_id}', task_id, result) with a short summary of what was done\n"
-                f"5. If you cannot complete a task (missing info, unclear requirements, technical blocker), still call complete_project_task but prefix the result with 'BLOCKED: ' followed by a clear explanation of exactly what is missing or wrong — be specific so the PM can relay it to the user\n"
-                f"6. If a task requires clarification before you can start, prefix with 'NEEDS_INFO: ' followed by your exact question\n"
-                f"7. Call write_project_event('{project_id}', 'completion', summary) when all tasks have been processed (done or blocked)\n"
+                f"You have been woken up by the PM to process pending tasks.\n"
+                f"Read {claude_md_path} for project conventions, then check your task queue.\n\n"
+                f"To read your pending tasks, run:\n"
+                f"```bash\n"
+                f'python -c "import sqlite3; conn = sqlite3.connect(r\'{db_path}\'); rows = conn.execute(\'SELECT id, description FROM tasks WHERE status=\\\"pending\\\"\').fetchall(); [print(f\\\"Task {{r[0]}}: {{r[1]}}\\\") for r in rows]; conn.close()"\n'
+                f"```\n\n"
+                f"Process each task. Remember: you CANNOT write files directly — use the approval system described in your system prompt.\n"
             )
             subprocess.Popen(
                 ["claude", "-p", prompt, "--output-format", "stream-json",
-                 "--verbose", "--allowedTools", "mcp__agent-system__*"],
+                 "--verbose", "--dangerously-skip-permissions",
+                 "--allowedTools", "Read,Glob,Grep,Bash",
+                 "--system-prompt", sys_prompt],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -344,15 +356,17 @@ def execute_pm_tool(name: str, tool_input: dict) -> str:
                 return json.dumps({"error": f"Project not found: {project_id}"})
             project_path   = project.get("path", "")
             claude_md_path = project.get("claude_md", os.path.join(project_path, "CLAUDE.md"))
+            sys_prompt = self._engineer_system_prompt(project) if hasattr(self, '_engineer_system_prompt') else ""
             prompt = (
-                f"You are a software engineer working on the project at {project_path}.\n"
-                f"Read {claude_md_path} for project conventions.\n\n"
                 f"The Project Manager is asking you:\n\n{message}\n\n"
-                f"Respond clearly and concisely. Use read_file / list_dir as needed to answer accurately."
+                f"Respond clearly and concisely. Use Read, Glob, Grep as needed to answer accurately.\n"
+                f"If the PM asks you to change files, use the approval system described in your system prompt."
             )
             try:
                 result = subprocess.run(
-                    ["claude", "-p", prompt],
+                    ["claude", "-p", prompt, "--dangerously-skip-permissions",
+                     "--allowedTools", "Read,Glob,Grep,Bash",
+                     "--system-prompt", sys_prompt],
                     capture_output=True, text=True, encoding="utf-8",
                     cwd=project_path, timeout=120,
                 )
@@ -859,27 +873,54 @@ class App(tk.Tk):
             f"## Your identity\n"
             f"You are an engineer for project '{project_id}' at {project_path}.\n\n"
             f"## Your tools\n"
-            f"Use only native tools: Read, Write, Edit, Bash, Glob, Grep.\n"
-            f"You have NO access to any MCP server — do not attempt to call MCP tools.\n\n"
+            f"Use only native tools: Read, Glob, Grep, Bash.\n"
+            f"You have NO access to any MCP server — do not attempt to call MCP tools.\n"
+            f"You do NOT have direct write permissions — all file writes must go through the approval system below.\n\n"
             f"## Task queue\n"
             f"The PM will inject your pending tasks directly into the conversation.\n"
-            f"Each task will have an ID, implement it using your file tools.\n\n"
+            f"Each task will have an ID — implement it using your tools.\n\n"
+            f"## How to write files (approval required)\n"
+            f"You CANNOT write files directly. You MUST run the Bash commands below — do not describe them, do not skip them, actually execute them.\n"
+            f"IMPORTANT: Do NOT ask the user for confirmation before submitting. Just submit the approval request immediately.\n"
+            f"The user will approve or reject through the UI — never ask 'should I go ahead?' or 'want me to make this edit?'.\n\n"
+            f"1. EXECUTE this Bash command to submit the request (replace placeholders):\n"
+            f"```bash\n"
+            f'python -c "\nimport sqlite3, uuid, datetime\n'
+            f'conn = sqlite3.connect(r\'{db_path}\')\n'
+            f'aid = str(uuid.uuid4())[:8]\n'
+            f'now = datetime.datetime.now().isoformat()\n'
+            f'conn.execute(\'INSERT INTO approvals VALUES (?,?,?,?,?,?,?)\', [aid, \'<file_path>\', \'<new_content>\', \'<description>\', \'pending\', now, now])\n'
+            f'conn.commit()\n'
+            f'print(aid)\n'
+            f'conn.close()\n'
+            f'"\n'
+            f"```\n\n"
+            f"2. Poll until approved or rejected:\n"
+            f"```bash\n"
+            f'python -c "\nimport sqlite3, time\n'
+            f'conn = sqlite3.connect(r\'{db_path}\')\n'
+            f'while True:\n'
+            f'    row = conn.execute(\'SELECT status FROM approvals WHERE id=?\', [\'<approval_id>\']).fetchone()\n'
+            f'    if row and row[0] != \'pending\': print(row[0]); break\n'
+            f'    time.sleep(2)\n'
+            f'conn.close()\n'
+            f'"\n'
+            f"```\n\n"
+            f"3. If approved, the UI writes the file. If rejected, adjust and resubmit.\n\n"
             f"## Marking tasks done\n"
-            f"When you finish a task, update its status in the project DB using Bash:\n"
+            f"When all file changes are approved and the task is complete:\n"
+            f"```bash\n"
+            f'python -c "import sqlite3, datetime; conn = sqlite3.connect(r\'{db_path}\'); conn.execute(\'UPDATE tasks SET status=\\\"done\\\", result=?, updated_at=? WHERE id=?\', [\'done - waiting for PM approval: <summary>\', datetime.datetime.now().isoformat(), \'<task_id>\']); conn.commit(); conn.close()"\n'
             f"```\n"
-            f'python -c "import sqlite3, datetime; conn = sqlite3.connect(r\'{db_path}\'); '
-            f'conn.execute(\'UPDATE tasks SET status=\\\"done\\\", result=?, updated_at=? WHERE id=?\', '
-            f'[\'done - waiting for PM approval: <summary>\', datetime.datetime.now().isoformat(), \'<task_id>\']); '
-            f'conn.commit(); conn.close()"\n'
-            f"```\n"
-            f"Replace <task_id> with the actual task ID and <summary> with what you did.\n"
-            f"Always end your result with 'done - waiting for PM approval'.\n"
         )
         return base + rules
 
     def _sync_project_agents(self):
         for p in load_projects():
             agent_id = p["id"]
+            db_path = p.get("db_path")
+            if db_path:
+                _ensure_project_db(db_path)
             if agent_id not in self._agent_rows:
                 self.registry.get_or_create(
                     agent_id, p["name"], p.get("path", REPO_DIR),
@@ -1167,15 +1208,63 @@ class App(tk.Tk):
 
     # ── Diff / pending writes ─────────────────────────────────
 
+    def _get_project_approvals(self) -> list:
+        """Collect pending approval requests from all project agent.db files."""
+        results = []
+        for p in load_projects():
+            db_path = p.get("db_path")
+            if not db_path or not os.path.exists(db_path):
+                continue
+            try:
+                conn = sqlite3.connect(db_path)
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM approvals WHERE status='pending' ORDER BY created_at ASC"
+                ).fetchall()
+                conn.close()
+                results.extend([{**dict(r), "project_id": p["id"], "project_name": p["name"]} for r in rows])
+            except Exception:
+                pass
+        return results
+
+    def _resolve_project_approval(self, approval: dict, approved: bool):
+        db_path = _get_project_db_path(approval["project_id"])
+        if not db_path:
+            return
+        conn = sqlite3.connect(db_path)
+        now = datetime.now().isoformat()
+        conn.execute(
+            "UPDATE approvals SET status=?, updated_at=? WHERE id=?",
+            ("approved" if approved else "rejected", now, approval["id"])
+        )
+        conn.commit()
+        conn.close()
+        if approved:
+            file_path = approval["file_path"]
+            # If path is relative, resolve against the project's directory
+            if not os.path.isabs(file_path):
+                project = next((p for p in load_projects() if p["id"] == approval["project_id"]), None)
+                if project:
+                    file_path = os.path.join(project["path"], file_path)
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(approval["new_content"])
+
     def _poll_pending_writes(self):
         try:
+            # Check MCP pending_writes first, then project approvals
             writes = get_pending_writes()
-            if writes:
-                first = writes[0]
-                if self._current_write is None or self._current_write["id"] != first["id"]:
+            approvals = self._get_project_approvals()
+            all_pending = writes + approvals
+
+            if all_pending:
+                first = all_pending[0]
+                item_id = first["id"]
+                if self._current_write is None or self._current_write["id"] != item_id:
                     self._current_write = first
                     self._show_diff(first)
-                    self.diff_status.config(text=f"{len(writes)} pending change(s)", fg="#f9e2af")
+                total = len(all_pending)
+                self.diff_status.config(text=f"{total} pending change(s)", fg="#f9e2af")
             else:
                 if self._current_write is not None:
                     self._current_write = None
@@ -1212,14 +1301,22 @@ class App(tk.Tk):
         self.diff_box.configure(state=tk.DISABLED)
 
     def _approve_write(self):
-        if self._current_write:
+        if not self._current_write:
+            return
+        if "project_id" in self._current_write:
+            self._resolve_project_approval(self._current_write, approved=True)
+        else:
             resolve_write_db(self._current_write["id"], approved=True)
-            self._current_write = None
+        self._current_write = None
 
     def _reject_write(self):
-        if self._current_write:
+        if not self._current_write:
+            return
+        if "project_id" in self._current_write:
+            self._resolve_project_approval(self._current_write, approved=False)
+        else:
             resolve_write_db(self._current_write["id"], approved=False)
-            self._current_write = None
+        self._current_write = None
 
 
 # ── Project dialog ────────────────────────────────────────────
