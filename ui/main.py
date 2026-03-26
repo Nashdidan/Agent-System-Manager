@@ -780,39 +780,27 @@ class App(tk.Tk):
         tk.Label(parent, text="Pending File Changes", bg="#1e1e2e", fg="#f9e2af",
                  font=("Consolas", 11, "bold")).pack(anchor=tk.W, pady=(8, 4))
 
-        diff_outer = tk.Frame(parent, bg="#1e1e2e", height=220)
-        diff_outer.pack(fill=tk.X)
-        diff_outer.pack_propagate(False)
+        # Compact list of pending approvals
+        approvals_outer = tk.Frame(parent, bg="#1e1e2e", height=150)
+        approvals_outer.pack(fill=tk.X)
+        approvals_outer.pack_propagate(False)
 
-        self.diff_box = tk.Text(
-            diff_outer, bg="#181825", fg="#cdd6f4", relief=tk.FLAT,
-            font=("Consolas", 10), state=tk.DISABLED, wrap=tk.NONE,
-            padx=8, pady=6,
+        self.approvals_list = tk.Listbox(
+            approvals_outer, bg="#181825", fg="#cdd6f4", relief=tk.FLAT,
+            font=("Consolas", 10), selectbackground="#313244",
+            selectforeground="#f9e2af", activestyle="none",
+            borderwidth=0, highlightthickness=0,
         )
-        diff_sy = tk.Scrollbar(diff_outer, command=self.diff_box.yview, bg="#313244")
-        diff_sx = tk.Scrollbar(diff_outer, orient=tk.HORIZONTAL,
-                               command=self.diff_box.xview, bg="#313244")
-        self.diff_box.configure(yscrollcommand=diff_sy.set, xscrollcommand=diff_sx.set)
-        diff_sy.pack(side=tk.RIGHT, fill=tk.Y)
-        diff_sx.pack(side=tk.BOTTOM, fill=tk.X)
-        self.diff_box.pack(fill=tk.BOTH, expand=True)
+        approvals_sy = tk.Scrollbar(approvals_outer, command=self.approvals_list.yview, bg="#313244")
+        self.approvals_list.configure(yscrollcommand=approvals_sy.set)
+        approvals_sy.pack(side=tk.RIGHT, fill=tk.Y)
+        self.approvals_list.pack(fill=tk.BOTH, expand=True)
+        self.approvals_list.bind("<Double-1>", self._open_review_window)
+        self._pending_items = []  # stores the actual approval dicts
 
-        self.diff_box.tag_config("added",   foreground="#a6e3a1")
-        self.diff_box.tag_config("removed", foreground="#f38ba8")
-        self.diff_box.tag_config("header",  foreground="#89b4fa", font=("Consolas", 10, "bold"))
-        self.diff_box.tag_config("meta",    foreground="#f9e2af")
-
-        diff_btns = tk.Frame(parent, bg="#1e1e2e")
-        diff_btns.pack(fill=tk.X, pady=(4, 0))
-        tk.Button(diff_btns, text="Approve", command=self._approve_write,
-                  bg="#a6e3a1", fg="#1e1e2e", relief=tk.FLAT,
-                  font=("Consolas", 11, "bold"), padx=14).pack(side=tk.LEFT, padx=(0, 6))
-        tk.Button(diff_btns, text="Reject", command=self._reject_write,
-                  bg="#f38ba8", fg="#1e1e2e", relief=tk.FLAT,
-                  font=("Consolas", 11, "bold"), padx=14).pack(side=tk.LEFT)
-        self.diff_status = tk.Label(diff_btns, text="No pending changes",
+        self.diff_status = tk.Label(parent, text="No pending changes — double-click to review",
                                     bg="#1e1e2e", fg="#6c7086", font=("Consolas", 10))
-        self.diff_status.pack(side=tk.LEFT, padx=12)
+        self.diff_status.pack(anchor=tk.W, pady=(4, 0))
 
     # ── Agent controls ────────────────────────────────────────
 
@@ -1257,30 +1245,157 @@ class App(tk.Tk):
             approvals = self._get_project_approvals()
             all_pending = writes + approvals
 
+            # Build list of current pending IDs
+            new_ids = [p["id"] for p in all_pending]
+            old_ids = [p["id"] for p in self._pending_items]
+
+            if new_ids != old_ids:
+                self._pending_items = all_pending
+                self.approvals_list.delete(0, tk.END)
+                for item in all_pending:
+                    project_name = item.get("project_name", item.get("project_id", "?"))
+                    desc = item.get("description", "file change")
+                    file_name = os.path.basename(item.get("file_path", ""))
+                    self.approvals_list.insert(tk.END, f"  [{project_name}] {desc}  ({file_name})")
+
             if all_pending:
-                first = all_pending[0]
-                item_id = first["id"]
-                if self._current_write is None or self._current_write["id"] != item_id:
-                    self._current_write = first
-                    self._show_diff(first)
-                total = len(all_pending)
-                self.diff_status.config(text=f"{total} pending change(s)", fg="#f9e2af")
+                self.diff_status.config(
+                    text=f"{len(all_pending)} pending change(s) — double-click to review", fg="#f9e2af")
             else:
-                if self._current_write is not None:
-                    self._current_write = None
-                    self._clear_diff()
+                self._pending_items = []
                 self.diff_status.config(text="No pending changes", fg="#6c7086")
         except Exception:
             pass
         self.after(2000, self._poll_pending_writes)
 
-    def _show_diff(self, write: dict):
+    def _open_review_window(self, event=None):
+        sel = self.approvals_list.curselection()
+        if not sel or not self._pending_items:
+            return
+        idx = sel[0]
+        if idx >= len(self._pending_items):
+            return
+        item = self._pending_items[idx]
+        ReviewWindow(self, item, on_resolve=self._on_review_resolved)
+
+    def _on_review_resolved(self):
+        """Called after approve/reject in the review window."""
+        self._current_write = None
+
+    def _approve_write(self, item: dict):
+        if "project_id" in item:
+            self._resolve_project_approval(item, approved=True)
+        else:
+            resolve_write_db(item["id"], approved=True)
+
+    def _reject_write(self, item: dict):
+        if "project_id" in item:
+            self._resolve_project_approval(item, approved=False)
+        else:
+            resolve_write_db(item["id"], approved=False)
+
+
+# ── Project dialog ────────────────────────────────────────────
+
+class ReviewWindow(tk.Toplevel):
+    """Popup window for reviewing a pending file change approval."""
+
+    def __init__(self, parent, approval: dict, on_resolve=None):
+        super().__init__(parent)
+        self.parent_app = parent
+        self._approval = approval
+        self._on_resolve = on_resolve
+        self.title(f"Review — {approval.get('description', 'file change')}")
+        self.configure(bg="#1e1e2e")
+        self.geometry("900x600")
+        self.grab_set()
+
+        # ── Top bar: project + description ──
+        top = tk.Frame(self, bg="#1e1e2e")
+        top.pack(fill=tk.X, padx=12, pady=(10, 4))
+        project_name = approval.get("project_name", approval.get("project_id", "?"))
+        tk.Label(top, text=f"[{project_name}]", bg="#1e1e2e", fg="#89b4fa",
+                 font=("Consolas", 12, "bold")).pack(side=tk.LEFT)
+        tk.Label(top, text=f"  {approval.get('description', '')}", bg="#1e1e2e", fg="#cdd6f4",
+                 font=("Consolas", 11)).pack(side=tk.LEFT)
+
+        # ── Main area ──
+        main = tk.Frame(self, bg="#1e1e2e")
+        main.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+
+        # Right side: file list
+        right = tk.Frame(main, bg="#181825", width=220)
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
+        right.pack_propagate(False)
+        tk.Label(right, text="Files", bg="#181825", fg="#f9e2af",
+                 font=("Consolas", 10, "bold")).pack(anchor=tk.W, padx=8, pady=(6, 4))
+        file_path = approval.get("file_path", "")
+        file_name = os.path.basename(file_path)
+        self._file_label = tk.Label(right, text=f"  {file_name}", bg="#313244", fg="#a6e3a1",
+                                    font=("Consolas", 10), anchor=tk.W, padx=6, pady=4)
+        self._file_label.pack(fill=tk.X, padx=4, pady=2)
+        tk.Label(right, text=file_path, bg="#181825", fg="#6c7086",
+                 font=("Consolas", 8), wraplength=200, anchor=tk.W).pack(anchor=tk.W, padx=8, pady=(2, 0))
+
+        # Left side: diff viewer
+        diff_frame = tk.Frame(main, bg="#181825")
+        diff_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.diff_box = tk.Text(
+            diff_frame, bg="#181825", fg="#cdd6f4", relief=tk.FLAT,
+            font=("Consolas", 10), state=tk.DISABLED, wrap=tk.NONE,
+            padx=8, pady=6,
+        )
+        diff_sy = tk.Scrollbar(diff_frame, command=self.diff_box.yview, bg="#313244")
+        diff_sx = tk.Scrollbar(diff_frame, orient=tk.HORIZONTAL,
+                               command=self.diff_box.xview, bg="#313244")
+        self.diff_box.configure(yscrollcommand=diff_sy.set, xscrollcommand=diff_sx.set)
+        diff_sy.pack(side=tk.RIGHT, fill=tk.Y)
+        diff_sx.pack(side=tk.BOTTOM, fill=tk.X)
+        self.diff_box.pack(fill=tk.BOTH, expand=True)
+
+        self.diff_box.tag_config("added",   foreground="#a6e3a1")
+        self.diff_box.tag_config("removed", foreground="#f38ba8")
+        self.diff_box.tag_config("header",  foreground="#89b4fa", font=("Consolas", 10, "bold"))
+        self.diff_box.tag_config("meta",    foreground="#f9e2af")
+
+        self._render_diff(approval)
+
+        # ── Bottom buttons ──
+        btns = tk.Frame(self, bg="#1e1e2e")
+        btns.pack(fill=tk.X, padx=12, pady=(4, 12))
+        tk.Button(btns, text="  Approve  ", command=self._approve,
+                  bg="#a6e3a1", fg="#1e1e2e", relief=tk.FLAT,
+                  font=("Consolas", 12, "bold"), padx=14).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(btns, text="  Reject  ", command=self._reject,
+                  bg="#f38ba8", fg="#1e1e2e", relief=tk.FLAT,
+                  font=("Consolas", 12, "bold"), padx=14).pack(side=tk.LEFT)
+
+    def _render_diff(self, approval: dict):
         self.diff_box.configure(state=tk.NORMAL)
         self.diff_box.delete("1.0", tk.END)
-        original = (write.get("original_content") or "").splitlines(keepends=True)
-        new      = (write.get("new_content") or "").splitlines(keepends=True)
-        self.diff_box.insert(tk.END, f"File: {write.get('file_path','')}\n", "header")
-        self.diff_box.insert(tk.END, f"Change: {write.get('description','')}\n\n", "meta")
+
+        file_path = approval.get("file_path", "")
+        # Try to read the current file content for a real diff
+        original_content = approval.get("original_content", "")
+        if not original_content and file_path:
+            abs_path = file_path
+            if not os.path.isabs(abs_path):
+                project = next((p for p in load_projects() if p["id"] == approval.get("project_id")), None)
+                if project:
+                    abs_path = os.path.join(project["path"], abs_path)
+            try:
+                with open(abs_path, "r", encoding="utf-8") as f:
+                    original_content = f.read()
+            except Exception:
+                original_content = ""
+
+        original = original_content.splitlines(keepends=True)
+        new = (approval.get("new_content") or "").splitlines(keepends=True)
+
+        self.diff_box.insert(tk.END, f"File: {file_path}\n", "header")
+        self.diff_box.insert(tk.END, f"Change: {approval.get('description', '')}\n\n", "meta")
+
         for line in difflib.unified_diff(original, new, fromfile="current",
                                          tofile="proposed", lineterm=""):
             if line.startswith(("+++", "---")):
@@ -1293,33 +1408,21 @@ class App(tk.Tk):
                 self.diff_box.insert(tk.END, line + "\n", "removed")
             else:
                 self.diff_box.insert(tk.END, line + "\n")
+
         self.diff_box.configure(state=tk.DISABLED)
 
-    def _clear_diff(self):
-        self.diff_box.configure(state=tk.NORMAL)
-        self.diff_box.delete("1.0", tk.END)
-        self.diff_box.configure(state=tk.DISABLED)
+    def _approve(self):
+        self.parent_app._approve_write(self._approval)
+        if self._on_resolve:
+            self._on_resolve()
+        self.destroy()
 
-    def _approve_write(self):
-        if not self._current_write:
-            return
-        if "project_id" in self._current_write:
-            self._resolve_project_approval(self._current_write, approved=True)
-        else:
-            resolve_write_db(self._current_write["id"], approved=True)
-        self._current_write = None
+    def _reject(self):
+        self.parent_app._reject_write(self._approval)
+        if self._on_resolve:
+            self._on_resolve()
+        self.destroy()
 
-    def _reject_write(self):
-        if not self._current_write:
-            return
-        if "project_id" in self._current_write:
-            self._resolve_project_approval(self._current_write, approved=False)
-        else:
-            resolve_write_db(self._current_write["id"], approved=False)
-        self._current_write = None
-
-
-# ── Project dialog ────────────────────────────────────────────
 
 class ProjectDialog(tk.Toplevel):
     def __init__(self, parent, title, on_save, existing=None):
