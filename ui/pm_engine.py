@@ -210,6 +210,58 @@ def ensure_project_db(db_path: str):
     conn.commit()
     conn.close()
 
+def ensure_central_db():
+    """Initialize agent_system.db tables (replaces server.py's init_db)."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id          TEXT PRIMARY KEY,
+            from_agent  TEXT NOT NULL,
+            to_agent    TEXT NOT NULL,
+            description TEXT NOT NULL,
+            status      TEXT DEFAULT 'pending',
+            result      TEXT,
+            created_at  TEXT,
+            updated_at  TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id          TEXT PRIMARY KEY,
+            from_agent  TEXT NOT NULL,
+            to_agent    TEXT NOT NULL,
+            content     TEXT NOT NULL,
+            type        TEXT DEFAULT 'message',
+            status      TEXT DEFAULT 'unread',
+            reply_to    TEXT,
+            created_at  TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pm_feed (
+            id         TEXT PRIMARY KEY,
+            project_id TEXT,
+            event_type TEXT,
+            summary    TEXT NOT NULL,
+            created_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pending_writes (
+            id               TEXT PRIMARY KEY,
+            project_id       TEXT NOT NULL,
+            file_path        TEXT NOT NULL,
+            original_content TEXT,
+            new_content      TEXT NOT NULL,
+            description      TEXT,
+            status           TEXT DEFAULT 'pending',
+            created_at       TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
 def load_conversation() -> list:
     if not os.path.exists(CONVERSATION_PATH):
         return []
@@ -415,6 +467,150 @@ def engineer_system_prompt(project: dict) -> str:
         f"```\n"
     )
     return base + rules
+
+# ── CLI PM system prompt ──────────────────────────────────────
+
+def cli_pm_system_prompt() -> str:
+    """Build the system prompt for PM running in CLI mode (claude -p)."""
+    parts = []
+
+    # Core identity — must come first and be unambiguous
+    parts.append(
+        "# You are a Project Manager (PM)\n\n"
+        "You coordinate software engineering work across multiple projects.\n"
+        "You assign tasks to engineers, wake them up, track progress, and report to the user.\n\n"
+        "CRITICAL RULES:\n"
+        "- You MUST NEVER modify, edit, or write project files directly. That is the engineer's job.\n"
+        "- You MUST NEVER use Bash to edit files (no sed, no python file writes, no echo redirects).\n"
+        "- If a task requires file changes, ALWAYS delegate to the engineer by creating a task and waking them.\n"
+        "- Even for 'simple' one-line changes — ALWAYS delegate. Never do it yourself.\n"
+        "- You may READ files to check status, but never WRITE them.\n"
+        "- The only files you may write are: pm_memory.md (via save_pm_memory) and database operations.\n\n"
+        "When the user greets you, introduce yourself as the Project Manager and ask what they need done."
+    )
+
+    # Load PM memory
+    if os.path.exists(PM_MEMORY_PATH):
+        memory = open(PM_MEMORY_PATH, "r", encoding="utf-8").read().strip()
+        if memory:
+            parts.append(f"## Your memory from previous sessions\n\n{memory}")
+
+    # Tool instructions — use pm_cli_tools.py for all operations
+    tools_script = os.path.join(UI_DIR, "pm_cli_tools.py").replace("\\", "\\\\")
+
+    tool_instructions = f"""## Your tools
+You have access to: Read, Glob, Grep, and Bash (ONLY for running pm_cli_tools.py).
+You have NO access to Edit, Write, or any MCP tools.
+
+## CRITICAL: You must NEVER edit project files
+You are a PM — you delegate file changes to engineers. You MUST NOT:
+- Use Bash to write, edit, or modify any file (no sed, no python open().write(), no echo >)
+- Use Bash for anything other than running pm_cli_tools.py
+- Make "simple" or "one-line" changes yourself — ALWAYS delegate to the engineer
+
+The ONLY Bash commands you may run are calls to pm_cli_tools.py as shown below.
+
+## How to perform PM operations
+All operations go through pm_cli_tools.py. Replace <placeholders> with actual values.
+
+### List all projects
+```bash
+python {tools_script} get_projects
+```
+
+### Create a task for a project engineer
+```bash
+python {tools_script} create_task '{{"project_id": "<project_id>", "description": "<what to do>"}}'
+```
+
+### Get tasks for a project (all statuses)
+```bash
+python {tools_script} get_tasks '{{"project_id": "<project_id>"}}'
+```
+
+### Complete a task
+```bash
+python {tools_script} complete_task '{{"project_id": "<project_id>", "task_id": "<task_id>", "result": "<summary>"}}'
+```
+
+### Wake an engineer to process tasks
+```bash
+python {tools_script} wake_engineer '{{"project_id": "<project_id>"}}'
+```
+
+### Ask an engineer a question (waits for response)
+```bash
+python {tools_script} ask_engineer '{{"project_id": "<project_id>", "message": "<question>"}}'
+```
+
+### Write to the live feed
+```bash
+python {tools_script} write_feed '{{"summary": "<text>", "project_id": "<project_id>", "event_type": "<info|task_created|task_done|bug|question>"}}'
+```
+
+### Save PM memory
+```bash
+python {tools_script} save_memory '{{"content": "<your notes>"}}'
+```
+
+### Cleanup completed tasks
+```bash
+python {tools_script} cleanup_tasks '{{"project_id": "<project_id>"}}'
+```
+
+### Get all central task status
+```bash
+python {tools_script} get_all_status
+```
+
+### Read files / List directories
+Use the native Read, Glob, Grep tools directly — no Bash needed for these.
+
+## Workflow
+1. When the user requests a change: create_task → wake_engineer → write_feed → tell the user
+2. After creating tasks, ALWAYS wake the project engineer
+3. After any significant action, write to the live feed
+4. Never modify files yourself — ALWAYS delegate to the engineer
+"""
+
+    parts.append(tool_instructions)
+    return "\n\n---\n\n".join(parts)
+
+# ── Event watcher (moved from MCP server) ────────────────────
+
+def get_unprocessed_events(db_path: str) -> list:
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM events WHERE status='unprocessed' ORDER BY created_at ASC"
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+def mark_event_processing(db_path: str, event_id: str):
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE events SET status='processing' WHERE id=?", (event_id,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def write_pm_feed_direct(summary: str, project_id: str = None, event_type: str = "info"):
+    """Write directly to pm_feed table (used by event watcher)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        feed_id = str(uuid.uuid4())[:8]
+        now = datetime.now().isoformat()
+        conn.execute("INSERT INTO pm_feed VALUES (?,?,?,?,?)",
+                     (feed_id, project_id, event_type, summary, now))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 # ── PM Tool execution ─────────────────────────────────────────
 

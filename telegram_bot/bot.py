@@ -27,10 +27,12 @@ try:
 except ImportError:
     pass  # dotenv is optional; fall back to real environment variables
 
+import sys
+
 try:
     import anthropic
 except ImportError:
-    raise SystemExit("Run: pip install anthropic")
+    anthropic = None
 
 try:
     from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -43,6 +45,7 @@ except ImportError:
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ALLOWED_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")  # leave empty to allow all (not recommended)
+PM_MODE           = os.environ.get("PM_MODE", "cli").lower()  # "api" or "cli" (default: cli)
 
 # ── Paths (mirrors ui/main.py) ────────────────────────────────
 
@@ -497,6 +500,68 @@ def _run_pm_loop_sync(user_message: str) -> str:
 
     return full_text or "(done)"
 
+
+# ── CLI PM loop ──────────────────────────────────────────────
+
+# Persistent session ID for CLI PM
+_cli_session_id: str = None
+
+def _run_pm_loop_cli(user_message: str) -> str:
+    """
+    Run PM via claude -p (CLI mode). Uses Max subscription — no API cost.
+    """
+    global _cli_session_id
+
+    # Build system prompt using pm_engine
+    sys.path.insert(0, UI_DIR)
+    from pm_engine import cli_pm_system_prompt
+
+    sys_prompt = cli_pm_system_prompt()
+
+    cmd = [
+        "claude", "-p", user_message,
+        "--output-format", "json",
+        "--dangerously-skip-permissions",
+        "--allowedTools", "Read,Glob,Grep,Bash",
+    ]
+
+    if _cli_session_id:
+        cmd += ["--resume", _cli_session_id]
+    else:
+        cmd += ["--system-prompt", sys_prompt]
+
+    # Strip ANTHROPIC_API_KEY so claude uses Max subscription, not API credits
+    cli_env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True, text=True, encoding="utf-8",
+            cwd=REPO_DIR, timeout=300, env=cli_env,
+        )
+        output = result.stdout.strip()
+
+        # Try to parse JSON output to extract text and session_id
+        try:
+            data = json.loads(output)
+            _cli_session_id = data.get("session_id", _cli_session_id)
+            # Extract text from result
+            text = data.get("result", "")
+            if not text:
+                # Try content blocks
+                for block in data.get("content", []):
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text += block.get("text", "")
+            return text or output or "(done)"
+        except json.JSONDecodeError:
+            return output or result.stderr.strip() or "(no response)"
+
+    except subprocess.TimeoutExpired:
+        return "PM did not respond within 5 minutes."
+    except FileNotFoundError:
+        return "Error: 'claude' command not found. Make sure Claude Code is installed."
+
+
 # ── Pending writes ────────────────────────────────────────────
 
 def get_pending_writes() -> list:
@@ -570,7 +635,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thinking_msg = await update.message.reply_text("Thinking...")
 
     try:
-        response_text = await asyncio.to_thread(_run_pm_loop_sync, user_text)
+        if PM_MODE == "api":
+            response_text = await asyncio.to_thread(_run_pm_loop_sync, user_text)
+        else:
+            response_text = await asyncio.to_thread(_run_pm_loop_cli, user_text)
     except Exception as e:
         await thinking_msg.edit_text(f"Error: {e}")
         return
@@ -653,10 +721,12 @@ async def poll_feed(context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not TELEGRAM_TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN environment variable")
-    if not ANTHROPIC_API_KEY:
-        raise SystemExit("Set ANTHROPIC_API_KEY environment variable")
+    if PM_MODE == "api" and not ANTHROPIC_API_KEY:
+        raise SystemExit("Set ANTHROPIC_API_KEY environment variable (or set PM_MODE=cli)")
+    if PM_MODE == "api" and not anthropic:
+        raise SystemExit("Run: pip install anthropic (or set PM_MODE=cli)")
 
-    print("Starting Telegram bot...")
+    print(f"Starting Telegram bot (PM mode: {PM_MODE})...")
     if ALLOWED_CHAT_ID:
         print(f"Restricted to chat ID: {ALLOWED_CHAT_ID}")
     else:
