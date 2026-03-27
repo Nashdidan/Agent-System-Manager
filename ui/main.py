@@ -11,8 +11,10 @@ import subprocess
 
 from agent_manager import AgentRegistry, IDLE, THINKING, DEAD
 from theme import (
-    BG_PRIMARY, BG_SECONDARY, BG_SURFACE, BG_SASH,
+    BG_PRIMARY, BG_SECONDARY, BG_SURFACE, BG_SASH, BG_HOVER,
     FG_PRIMARY, FG_DIM, FG_BLUE, FG_GREEN, FG_RED, FG_YELLOW,
+    FONT, FONT_SM, FONT_MD, FONT_LG,
+    FONT_BOLD, FONT_MD_BOLD, FONT_LG_BOLD,
     FONT_MONO, FONT_MONO_SM, FONT_MONO_MD, FONT_MONO_LG,
     FONT_MONO_BOLD, FONT_MONO_MD_BOLD,
     BTN_MUTED, BTN_SMALL, SCROLLBAR,
@@ -99,50 +101,52 @@ class App(tk.Tk):
     # ── UI construction ──────────────────────────────────────
 
     def _build_ui(self):
-        # Top bar
-        top_bar = tk.Frame(self, bg=BG_SECONDARY, pady=6)
-        top_bar.pack(fill=tk.X, padx=8, pady=(8, 0))
+        from theme import BG_TOOLBAR
+        top_bar = tk.Frame(self, bg=BG_TOOLBAR)
+        top_bar.pack(fill=tk.X)
+
         self._api_key_var = tk.StringVar()
-        self._pm_status_label = tk.Label(top_bar, text="\u25cf idle", bg=BG_SECONDARY,
-                                          fg=FG_GREEN, font=FONT_MONO)
-        self._pm_status_label.pack(side=tk.LEFT, padx=16)
 
-        self._bot_status_label = tk.Label(top_bar, text="\u25cb Bot: stopped", bg=BG_SECONDARY,
-                                           fg=FG_DIM, font=FONT_MONO)
-        self._bot_status_label.pack(side=tk.LEFT, padx=8)
+        self._pm_status_label = tk.Label(top_bar, text="\u25cf idle", bg=BG_TOOLBAR,
+                                          fg=FG_GREEN, font=FONT_MONO_SM)
+        self._pm_status_label.pack(side=tk.LEFT, padx=(8, 6))
 
-        tk.Button(top_bar, text="\u2699 Settings", command=self._open_settings,
-                  **BTN_MUTED).pack(side=tk.RIGHT, padx=8)
+        self._bot_status_label = tk.Label(top_bar, text="\u25cb bot", bg=BG_TOOLBAR,
+                                           fg=FG_DIM, font=FONT_MONO_SM)
+        self._bot_status_label.pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Button(top_bar, text="\u2699", command=self._open_settings,
+                  bg=BG_TOOLBAR, fg=FG_DIM, relief=tk.FLAT,
+                  font=FONT_SM, cursor="hand2", padx=4
+                  ).pack(side=tk.RIGHT, padx=6, pady=2)
 
         # PM mode toggle
-        mode_frame = tk.Frame(top_bar, bg=BG_SECONDARY)
-        mode_frame.pack(side=tk.RIGHT, padx=8)
-        tk.Label(mode_frame, text="PM:", bg=BG_SECONDARY, fg=FG_DIM,
-                 font=FONT_MONO_SM).pack(side=tk.LEFT, padx=(0, 4))
+        mode_frame = tk.Frame(top_bar, bg=BG_SURFACE)
+        mode_frame.pack(side=tk.RIGHT, padx=4, pady=3)
         self._pm_mode_var = tk.StringVar(value="api")
         self._api_radio = tk.Radiobutton(
-            mode_frame, text="API", variable=self._pm_mode_var, value="api",
+            mode_frame, text="api", variable=self._pm_mode_var, value="api",
             command=self._on_pm_mode_changed,
-            bg=BG_SECONDARY, fg=FG_BLUE, selectcolor=BG_SURFACE,
-            activebackground=BG_SECONDARY, activeforeground=FG_BLUE,
-            font=FONT_MONO_BOLD, indicatoron=False, padx=8, pady=2,
+            bg=FG_BLUE, fg="#ffffff", selectcolor=FG_BLUE,
+            activebackground=FG_BLUE, activeforeground="#ffffff",
+            font=FONT_MONO_SM, indicatoron=False, padx=6, pady=0,
             relief=tk.FLAT, bd=0,
         )
-        self._api_radio.pack(side=tk.LEFT, padx=1)
+        self._api_radio.pack(side=tk.LEFT)
         self._cli_radio = tk.Radiobutton(
-            mode_frame, text="CLI", variable=self._pm_mode_var, value="cli",
+            mode_frame, text="cli", variable=self._pm_mode_var, value="cli",
             command=self._on_pm_mode_changed,
-            bg=BG_SECONDARY, fg=FG_DIM, selectcolor=BG_SURFACE,
-            activebackground=BG_SECONDARY, activeforeground=FG_GREEN,
-            font=FONT_MONO_BOLD, indicatoron=False, padx=8, pady=2,
+            bg=BG_SURFACE, fg=FG_DIM, selectcolor=FG_GREEN,
+            activebackground=FG_GREEN, activeforeground="#ffffff",
+            font=FONT_MONO_SM, indicatoron=False, padx=6, pady=0,
             relief=tk.FLAT, bd=0,
         )
-        self._cli_radio.pack(side=tk.LEFT, padx=1)
+        self._cli_radio.pack(side=tk.LEFT)
 
-        # Main PanedWindow with 4 resizable/detachable panels
+        # Main PanedWindow
         paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg=BG_SASH,
-                               sashwidth=5, sashrelief=tk.FLAT)
-        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+                               sashwidth=2, sashrelief=tk.FLAT)
+        paned.pack(fill=tk.BOTH, expand=True)
 
         self.panel_mgr = PanelManager(self, paned)
 
@@ -168,18 +172,19 @@ class App(tk.Tk):
             messagebox.showinfo("PM is busy", "Wait for the PM to finish before switching modes.")
             return
         self._pm_mode = mode
+        from theme import BG_SURFACE
         if mode == "api":
-            self._api_radio.config(fg=FG_BLUE)
-            self._cli_radio.config(fg=FG_DIM)
-            self._pm_status_label.config(text="\u25cf API idle", fg=FG_GREEN)
-            self._pm_mode_label.config(text="[API]")
+            self._api_radio.config(bg=FG_BLUE, fg="#ffffff")
+            self._cli_radio.config(bg=BG_SURFACE, fg=FG_DIM)
+            self._pm_status_label.config(text="\u25cf api idle", fg=FG_GREEN)
+            self._pm_mode_label.config(text="api")
             self._pm_wake_btn.pack_forget()
             self._pm_kill_btn.pack_forget()
         else:
-            self._api_radio.config(fg=FG_DIM)
-            self._cli_radio.config(fg=FG_GREEN)
-            self._pm_status_label.config(text="\u25cf CLI idle", fg=FG_GREEN)
-            self._pm_mode_label.config(text="[CLI]")
+            self._api_radio.config(bg=BG_SURFACE, fg=FG_DIM)
+            self._cli_radio.config(bg=FG_GREEN, fg="#ffffff")
+            self._pm_status_label.config(text="\u25cf cli idle", fg=FG_GREEN)
+            self._pm_mode_label.config(text="cli")
             self._pm_wake_btn.pack(side=tk.LEFT, padx=1)
             self._pm_kill_btn.pack(side=tk.LEFT, padx=1)
 
@@ -259,47 +264,49 @@ class App(tk.Tk):
 
     def _switch_agent(self, agent_id: str):
         self._active_agent_id = agent_id
+        from theme import BG_SURFACE
         for aid, widgets in self._agent_rows.items():
-            from theme import BG_HIGHLIGHT
-            bg = BG_HIGHLIGHT if aid == agent_id else BG_SECONDARY
+            selected = aid == agent_id
+            bg = BG_SURFACE if selected else BG_SECONDARY
+            fg = FG_PRIMARY if selected else FG_DIM
             widgets["row"].config(bg=bg)
             widgets["dot"].config(bg=bg)
-            widgets["label"].config(bg=bg)
+            widgets["label"].config(bg=bg, fg=fg)
         if agent_id == "PM":
             name = "Project Manager"
         else:
             projects = load_projects()
             p = next((p for p in projects if p["id"] == agent_id), None)
             name = p["name"] if p else agent_id
-        self._chat_title.config(text=f"Chat \u2014 {name}")
+        self._chat_title.config(text=name)
 
     def _add_agent_row(self, agent_id: str, display_name: str):
         if agent_id in self._agent_rows:
             return
         row = tk.Frame(self.agents_frame, bg=BG_SECONDARY, cursor="hand2")
-        row.pack(fill=tk.X, pady=2)
+        row.pack(fill=tk.X, pady=1)
         row.bind("<Button-1>", lambda e, aid=agent_id: self._switch_agent(aid))
 
         dot = tk.Label(row, text="\u25cb", bg=BG_SECONDARY, fg=FG_DIM,
-                       font=FONT_MONO_LG, cursor="hand2")
-        dot.pack(side=tk.LEFT, padx=(0, 4))
+                       font=FONT_MONO_SM, cursor="hand2")
+        dot.pack(side=tk.LEFT, padx=(6, 4))
         dot.bind("<Button-1>", lambda e, aid=agent_id: self._switch_agent(aid))
 
-        label = tk.Label(row, text=display_name, bg=BG_SECONDARY, fg=FG_PRIMARY,
-                         font=FONT_MONO, cursor="hand2")
+        label = tk.Label(row, text=display_name, bg=BG_SECONDARY, fg=FG_DIM,
+                         font=FONT_SM, cursor="hand2")
         label.pack(side=tk.LEFT, fill=tk.X, expand=True)
         label.bind("<Button-1>", lambda e, aid=agent_id: self._switch_agent(aid))
 
         btn_frame = tk.Frame(row, bg=BG_SECONDARY)
-        btn_frame.pack(side=tk.RIGHT)
-        tk.Button(btn_frame, text="Wake",
+        btn_frame.pack(side=tk.RIGHT, padx=2)
+        tk.Button(btn_frame, text="w",
                   command=lambda aid=agent_id: self._wake_agent(aid),
                   bg=BG_SURFACE, fg=FG_GREEN, relief=tk.FLAT,
-                  font=FONT_MONO_SM, padx=4).pack(side=tk.LEFT, padx=1)
-        tk.Button(btn_frame, text="Kill",
+                  font=FONT_MONO_SM, padx=2, cursor="hand2").pack(side=tk.LEFT, padx=1)
+        tk.Button(btn_frame, text="k",
                   command=lambda aid=agent_id: self._kill_agent(aid),
                   bg=BG_SURFACE, fg=FG_RED, relief=tk.FLAT,
-                  font=FONT_MONO_SM, padx=4).pack(side=tk.LEFT, padx=1)
+                  font=FONT_MONO_SM, padx=2, cursor="hand2").pack(side=tk.LEFT, padx=1)
         self._agent_rows[agent_id] = {"dot": dot, "label": label, "row": row}
 
     def _wake_agent(self, agent_id: str):
