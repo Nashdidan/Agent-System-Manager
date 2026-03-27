@@ -10,10 +10,37 @@ import subprocess
 import uuid
 from datetime import datetime
 
+import shutil
+
 try:
     import anthropic
 except ImportError:
     anthropic = None
+
+# ── Environment detection ─────────────────────────────────────
+
+def detect_claude_cli() -> bool:
+    """Check if Claude Code CLI is installed and on PATH."""
+    return shutil.which("claude") is not None
+
+def detect_node() -> bool:
+    """Check if Node.js is installed (needed to install Claude Code via npm)."""
+    return shutil.which("node") is not None
+
+def install_claude_cli() -> tuple[bool, str]:
+    """Try to install Claude Code via npm. Returns (success, message)."""
+    if not detect_node():
+        return False, "Node.js is not installed. Install it from https://nodejs.org first."
+    try:
+        result = subprocess.run(
+            ["npm", "install", "-g", "@anthropic-ai/claude-code"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            return True, "Claude Code installed successfully. Please run 'claude login' in a terminal to authenticate."
+        return False, f"Install failed: {result.stderr.strip()}"
+    except Exception as e:
+        return False, f"Install failed: {e}"
 
 # ── Paths ─────────────────────────────────────────────────────
 

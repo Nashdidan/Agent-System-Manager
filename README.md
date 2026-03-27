@@ -1,36 +1,76 @@
- # Agent System Manager
+# Agent System
 
-  A personal dev tool I built to manage AI agents across multiple projects. You talk to a Project Manager that breaks
-  down your requests into tasks and sends them to engineer agents working on your actual codebase.
+I built this to manage AI agents across my projects. You talk to a Project Manager, it breaks your requests into tasks, sends them to engineer agents, and every file change goes through your approval before anything touches disk.
 
-  ## What it does
+## How it works
 
-  - Chat with the PM in a desktop UI or Telegram
-  - PM delegates tasks to engineer agents (runs on Claude Code CLI — uses Max subscription, no extra API cost)
-  - Engineers work directly on your project files
-  - Every file change goes through a diff approval screen before touching disk
-  - Live feed shows what's happening across all projects
+You open the app and chat with the PM. When you ask for something, the PM creates tasks and wakes up engineer agents that work directly on your codebase. Engineers can't write files on their own though. They propose changes, you see the diff in the approval panel, and you decide what gets written.
 
-  ## You'll need
+There's also a live feed that shows everything happening across all projects in real time, and all the panels can be resized or popped out into their own windows.
 
-  - Python 3.13+
-  - [Claude Code CLI](https://claude.ai/code) on your PATH
-  - Anthropic API key
+## PM modes
 
-  ## Getting started
+The PM can run in two ways. **API mode** uses the Anthropic SDK with your API key (costs credits). **CLI mode** runs through Claude Code on your Max subscription (free). You switch between them with a toggle in the top bar. Both do the same thing.
 
-  1. `pip install fastmcp` inside `mcp_server/`
-  2. Run `python mcp_server/server.py`
-  3. Run `python ui/main.py`
-  4. Hit Settings, drop in your API key, save
-  5. Add your projects with **+ Add** and start talking to the PM
+## What you need
 
-  ## Telegram (optional)
+Python 3.10+ and Claude Code CLI installed and logged in. If you only want API mode, you just need an API key and Claude Code is optional.
 
-  Same conversation as the desktop UI, just on your phone. Set it up from **⚙ Settings** — you'll need a bot token from
-  BotFatherand your chat ID.
+When you first open the app, if Claude Code isn't found it'll show a setup wizard with options to install it or continue with API mode only.
 
-  1. Install dependencies: `pip install -r requirements.txt` inside `telegram_bot/`
-  2. Get a bot token from [@BotFather](https://t.me/botfather)
-  3. Open Settings in the UI → enter your `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` → Save
-  4. Hit Start Bot — the UI handles the rest
+## Getting started
+
+```
+pip install -r requirements.txt
+cd ui
+python main.py
+```
+
+The app creates all the database files on its own. Add your projects with the + button, point to the project directory, and start chatting with the PM.
+
+## Standalone executable
+
+If you don't want to deal with Python:
+
+```
+cd installer
+python build.py
+```
+
+This gives you `installer/dist/AgentSystem.exe`. Just needs Claude Code CLI on the target machine.
+
+## Telegram bot
+
+Same PM, same conversation, on your phone. Set it up from Settings in the app. You need a bot token from @BotFather and your chat ID. The bot defaults to CLI mode (free).
+
+```
+cd telegram_bot
+pip install -r requirements.txt
+```
+
+## Project structure
+
+```
+agent-system/
+  ui/                    the desktop app
+    main.py              entry point
+    panels.py            detachable panel system
+    dialogs.py           review window, settings, setup wizard
+    pm_engine.py         PM tools, DB helpers, prompts
+    pm_cli_tools.py      CLI tool runner for PM
+    agent_manager.py     engineer session management
+    theme.py             colors and fonts (cross platform)
+  telegram_bot/          telegram interface
+  mcp_server/            legacy, no longer required
+  installer/             builds the .exe
+  pm_instructions.md     PM system prompt
+  pm_memory.md           PM persistent memory
+```
+
+## How engineers work
+
+Engineers are Claude Code subprocesses with restricted tools. They can read the codebase but can't edit files directly. When they want to change something, they write the proposed change to their project's database. The app picks it up, shows you the diff, and you approve or reject. The PM never touches files either, it only creates tasks and wakes engineers.
+
+## Cross platform
+
+Works on Windows, macOS, and Linux. Fonts and paths adjust automatically.
