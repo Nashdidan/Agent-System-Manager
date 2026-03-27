@@ -186,10 +186,10 @@ def build_chat_panel(parent: tk.Frame, app):
     chat_scroll.pack(side=tk.RIGHT, fill=tk.Y)
     app.chat_box.pack(fill=tk.BOTH, expand=True)
 
-    app.chat_box.tag_config("user",  foreground=FG_BLUE, font=("Cascadia Mono", 9, "bold"))
+    app.chat_box.tag_config("user",  foreground=FG_BLUE, font=FONT_BOLD)
     app.chat_box.tag_config("pm",    foreground=FG_PRIMARY, font=FONT_SM)
     app.chat_box.tag_config("tool",  foreground=FG_DIM, font=FONT_MONO_SM)
-    app.chat_box.tag_config("error", foreground=FG_RED, font=("Cascadia Mono", 9, "bold"))
+    app.chat_box.tag_config("error", foreground=FG_RED, font=FONT_BOLD)
 
     # Input bar
     input_frame = tk.Frame(parent, bg=BG_SECONDARY)

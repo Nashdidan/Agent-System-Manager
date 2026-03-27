@@ -217,5 +217,8 @@ ui/agent_sessions.json
 telegram_bot/.env
 agents/sapi.txt
 projects.json
+installer/dist/
+installer/build/
+installer/*.spec
 SakranelPro/
 .idea/

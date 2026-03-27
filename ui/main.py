@@ -19,10 +19,11 @@ from theme import (
     FONT_MONO_BOLD, FONT_MONO_MD_BOLD,
     BTN_MUTED, BTN_SMALL, SCROLLBAR,
 )
+from theme import PYTHON_CMD
 from pm_engine import (
     anthropic, PM_TOOLS, PM_MODEL, REPO_DIR, TELEGRAM_BOT_SCRIPT,
     load_projects, save_projects, load_conversation, save_conversation,
-    load_env, load_pm_system_prompt, ensure_project_db, ensure_central_db,
+    load_env, load_pm_system_prompt, ensure_project_db, ensure_central_db, ensure_project_files,
     execute_pm_tool, trim_messages,
     get_pending_writes, resolve_write_db, get_feed_since,
     get_project_approvals, resolve_project_approval,
@@ -240,7 +241,7 @@ class App(tk.Tk):
             )
             return
         self._bot_process = subprocess.Popen(
-            ["python", TELEGRAM_BOT_SCRIPT],
+            [PYTHON_CMD, TELEGRAM_BOT_SCRIPT],
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -339,9 +340,7 @@ class App(tk.Tk):
     def _sync_project_agents(self):
         for p in load_projects():
             agent_id = p["id"]
-            db_path = p.get("db_path")
-            if db_path:
-                ensure_project_db(db_path)
+            ensure_project_files(p)
             if agent_id not in self._agent_rows:
                 self.registry.get_or_create(
                     agent_id, p["name"], p.get("path", REPO_DIR),

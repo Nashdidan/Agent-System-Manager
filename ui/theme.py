@@ -1,4 +1,18 @@
-# ── Theme — macOS Terminal style ──────────────────────────────
+# ── Theme — macOS Terminal style, cross-platform ─────────────
+import sys
+import platform
+
+# ── Platform-aware font selection ─────────────────────────────
+_os = platform.system()
+if _os == "Darwin":       # macOS
+    _MONO = "Menlo"
+elif _os == "Windows":
+    _MONO = "Cascadia Mono"
+else:                     # Linux
+    _MONO = "DejaVu Sans Mono"
+
+# ── Platform-aware python command ─────────────────────────────
+PYTHON_CMD = sys.executable  # always correct, even in venvs
 
 # Colors (Terminal.app dark profile)
 BG_PRIMARY   = "#1e1e1e"
@@ -21,26 +35,26 @@ FG_ORANGE    = "#d19a66"
 FG_INDIGO    = "#7c7cba"
 
 # Fonts — all monospace, compact
-FONT_SM        = ("Cascadia Mono", 9)
-FONT           = ("Cascadia Mono", 9)
-FONT_MD        = ("Cascadia Mono", 10)
-FONT_LG        = ("Cascadia Mono", 11)
-FONT_XL        = ("Cascadia Mono", 12)
-FONT_BOLD      = ("Cascadia Mono", 9, "bold")
-FONT_MD_BOLD   = ("Cascadia Mono", 10, "bold")
-FONT_LG_BOLD   = ("Cascadia Mono", 11, "bold")
-FONT_XL_BOLD   = ("Cascadia Mono", 12, "bold")
-FONT_ITALIC    = ("Cascadia Mono", 9, "italic")
-FONT_MONO      = ("Cascadia Mono", 9)
-FONT_MONO_SM   = ("Cascadia Mono", 8)
-FONT_MONO_BOLD = ("Cascadia Mono", 9, "bold")
+FONT_SM        = (_MONO, 9)
+FONT           = (_MONO, 9)
+FONT_MD        = (_MONO, 10)
+FONT_LG        = (_MONO, 11)
+FONT_XL        = (_MONO, 12)
+FONT_BOLD      = (_MONO, 9, "bold")
+FONT_MD_BOLD   = (_MONO, 10, "bold")
+FONT_LG_BOLD   = (_MONO, 11, "bold")
+FONT_XL_BOLD   = (_MONO, 12, "bold")
+FONT_ITALIC    = (_MONO, 9, "italic")
+FONT_MONO      = (_MONO, 9)
+FONT_MONO_SM   = (_MONO, 8)
+FONT_MONO_BOLD = (_MONO, 9, "bold")
 
 # Backward compat aliases
-FONT_MONO_MD       = ("Cascadia Mono", 10)
-FONT_MONO_LG       = ("Cascadia Mono", 11)
-FONT_MONO_MD_BOLD  = ("Cascadia Mono", 10, "bold")
-FONT_MONO_LG_BOLD  = ("Cascadia Mono", 11, "bold")
-FONT_MONO_ITALIC   = ("Cascadia Mono", 9, "italic")
+FONT_MONO_MD       = (_MONO, 10)
+FONT_MONO_LG       = (_MONO, 11)
+FONT_MONO_MD_BOLD  = (_MONO, 10, "bold")
+FONT_MONO_LG_BOLD  = (_MONO, 11, "bold")
+FONT_MONO_ITALIC   = (_MONO, 9, "italic")
 
 # Buttons
 BTN_PRIMARY = dict(bg=FG_BLUE, fg="#ffffff", relief="flat", font=FONT_BOLD,
