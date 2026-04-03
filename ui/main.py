@@ -19,21 +19,23 @@ from theme import (
     FONT_MONO_BOLD, FONT_MONO_MD_BOLD,
     BTN_MUTED, BTN_SMALL, SCROLLBAR,
 )
+from theme import PYTHON_CMD
 from pm_engine import (
     anthropic, PM_TOOLS, PM_MODEL, REPO_DIR, TELEGRAM_BOT_SCRIPT,
     load_projects, save_projects, load_conversation, save_conversation,
-    load_env, load_pm_system_prompt, ensure_project_db, ensure_central_db,
+    load_env, load_pm_system_prompt, ensure_project_db, ensure_central_db, ensure_project_files,
     execute_pm_tool, trim_messages,
     get_pending_writes, resolve_write_db, get_feed_since,
     get_project_approvals, resolve_project_approval,
     inject_pending_tasks, engineer_system_prompt, cli_pm_system_prompt,
     get_unprocessed_events, mark_event_processing, write_pm_feed_direct,
+    detect_claude_cli,
 )
 from panels import (
     PanelManager,
     build_agents_panel, build_chat_panel, build_feed_panel, build_approvals_panel,
 )
-from dialogs import ReviewWindow, ProjectDialog, SettingsDialog
+from dialogs import ReviewWindow, ProjectDialog, SettingsDialog, SetupWizard
 
 
 class App(tk.Tk):
@@ -56,18 +58,21 @@ class App(tk.Tk):
         self._active_agent_id = "PM"
         self._agent_rows: dict[str, dict] = {}
         self._bot_process: subprocess.Popen | None = None
-        self._pm_mode = "api"  # "api" or "cli"
+        self._claude_available = detect_claude_cli()
+        self._pm_mode = "cli" if self._claude_available else "api"
 
         self.registry = AgentRegistry()
 
-        # Create a PM CLI agent (used when mode is "cli")
-        from agent_manager import AgentProcess
-        self._pm_cli_agent = AgentProcess(
-            "PM_CLI", "PM (CLI)", REPO_DIR,
-            system_prompt=cli_pm_system_prompt(),
-            on_session_saved=lambda aid, sid: None,
-        )
-        self._pm_cli_agent.start()
+        # Create PM CLI agent only if Claude Code is available
+        self._pm_cli_agent = None
+        if self._claude_available:
+            from agent_manager import AgentProcess
+            self._pm_cli_agent = AgentProcess(
+                "PM_CLI", "PM (CLI)", REPO_DIR,
+                system_prompt=cli_pm_system_prompt(),
+                on_session_saved=lambda aid, sid: None,
+            )
+            self._pm_cli_agent.start()
 
         self._build_ui()
 
@@ -83,6 +88,25 @@ class App(tk.Tk):
         self._sync_project_agents()
         self._poll_events()
 
+        # Show setup wizard if Claude Code not found
+        if not self._claude_available:
+            self.after(500, lambda: SetupWizard(self))
+            self._apply_claude_availability()
+        else:
+            self._apply_claude_availability()
+
+    def _apply_claude_availability(self):
+        """Enable/disable CLI features based on Claude Code availability."""
+        if self._claude_available:
+            self._cli_radio.config(state=tk.NORMAL)
+            self._pm_mode_var.set(self._pm_mode)
+            self._on_pm_mode_changed()
+        else:
+            self._cli_radio.config(state=tk.DISABLED, fg=FG_DIM)
+            self._pm_mode_var.set("api")
+            self._pm_mode = "api"
+            self._on_pm_mode_changed()
+
     # ── API message building ─────────────────────────────────
 
     def _build_api_messages(self) -> list:
@@ -94,7 +118,8 @@ class App(tk.Tk):
 
     def _on_close(self):
         self.registry.kill_all()
-        self._pm_cli_agent.kill()
+        if self._pm_cli_agent:
+            self._pm_cli_agent.kill()
         self._stop_bot()
         self.destroy()
 
@@ -167,6 +192,12 @@ class App(tk.Tk):
 
     def _on_pm_mode_changed(self):
         mode = self._pm_mode_var.get()
+        if mode == "cli" and not self._claude_available:
+            self._pm_mode_var.set("api")
+            messagebox.showinfo("Claude Code not found",
+                                "Install Claude Code CLI to use CLI mode.\n"
+                                "Go to Settings or run: npm install -g @anthropic-ai/claude-code")
+            return
         if self._pm_thinking:
             self._pm_mode_var.set(self._pm_mode)
             messagebox.showinfo("PM is busy", "Wait for the PM to finish before switching modes.")
@@ -185,14 +216,25 @@ class App(tk.Tk):
             self._cli_radio.config(bg=FG_GREEN, fg="#ffffff")
             self._pm_status_label.config(text="\u25cf cli idle", fg=FG_GREEN)
             self._pm_mode_label.config(text="cli")
+            # Create CLI agent on first switch if needed
+            if not self._pm_cli_agent:
+                from agent_manager import AgentProcess
+                self._pm_cli_agent = AgentProcess(
+                    "PM_CLI", "PM (CLI)", REPO_DIR,
+                    system_prompt=cli_pm_system_prompt(),
+                    on_session_saved=lambda aid, sid: None,
+                )
+                self._pm_cli_agent.start()
             self._pm_wake_btn.pack(side=tk.LEFT, padx=1)
             self._pm_kill_btn.pack(side=tk.LEFT, padx=1)
 
     def _wake_pm_cli(self):
-        if self._pm_cli_agent.status == DEAD:
+        if self._pm_cli_agent and self._pm_cli_agent.status == DEAD:
             self._pm_cli_agent.start()
 
     def _kill_pm_cli(self):
+        if not self._pm_cli_agent:
+            return
         self._pm_cli_agent.kill()
         # Recreate with fresh system prompt
         from agent_manager import AgentProcess
@@ -240,7 +282,7 @@ class App(tk.Tk):
             )
             return
         self._bot_process = subprocess.Popen(
-            ["python", TELEGRAM_BOT_SCRIPT],
+            [PYTHON_CMD, TELEGRAM_BOT_SCRIPT],
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -339,9 +381,7 @@ class App(tk.Tk):
     def _sync_project_agents(self):
         for p in load_projects():
             agent_id = p["id"]
-            db_path = p.get("db_path")
-            if db_path:
-                ensure_project_db(db_path)
+            ensure_project_files(p)
             if agent_id not in self._agent_rows:
                 self.registry.get_or_create(
                     agent_id, p["name"], p.get("path", REPO_DIR),
@@ -477,6 +517,11 @@ class App(tk.Tk):
                                  daemon=True).start()
             else:
                 # CLI mode — route through AgentProcess
+                if not self._pm_cli_agent or not self._claude_available:
+                    messagebox.showerror("Claude Code not found",
+                                         "Install Claude Code CLI to use CLI mode.")
+                    self._set_pm_thinking(False)
+                    return
                 if self._pm_cli_agent.status == DEAD:
                     self._pm_cli_agent.start()
                 self.input_var.set("")

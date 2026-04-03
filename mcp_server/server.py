@@ -26,7 +26,12 @@ def init_all_project_dbs():
     with open(PROJECTS_PATH, "r", encoding="utf-8") as f:
         projects = json.load(f)
     for p in projects:
-        db_path = p.get("db_path")
+        db_path = p.get("db_path", "")
+        # Auto-fix if db_path points to directory instead of file
+        if db_path and os.path.isdir(db_path):
+            db_path = os.path.join(db_path, "agent.db")
+        elif not db_path and p.get("path"):
+            db_path = os.path.join(p["path"], "agent.db")
         if db_path:
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
             project_database.init_project_db(db_path)

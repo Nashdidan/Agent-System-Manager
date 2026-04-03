@@ -10,10 +10,37 @@ import subprocess
 import uuid
 from datetime import datetime
 
+import shutil
+
 try:
     import anthropic
 except ImportError:
     anthropic = None
+
+# ── Environment detection ─────────────────────────────────────
+
+def detect_claude_cli() -> bool:
+    """Check if Claude Code CLI is installed and on PATH."""
+    return shutil.which("claude") is not None
+
+def detect_node() -> bool:
+    """Check if Node.js is installed (needed to install Claude Code via npm)."""
+    return shutil.which("node") is not None
+
+def install_claude_cli() -> tuple[bool, str]:
+    """Try to install Claude Code via npm. Returns (success, message)."""
+    if not detect_node():
+        return False, "Node.js is not installed. Install it from https://nodejs.org first."
+    try:
+        result = subprocess.run(
+            ["npm", "install", "-g", "@anthropic-ai/claude-code"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            return True, "Claude Code installed successfully. Please run 'claude login' in a terminal to authenticate."
+        return False, f"Install failed: {result.stderr.strip()}"
+    except Exception as e:
+        return False, f"Install failed: {e}"
 
 # ── Paths ─────────────────────────────────────────────────────
 
@@ -159,11 +186,34 @@ PM_TOOLS = [
 
 # ── Project / persistence helpers ─────────────────────────────
 
+def _resolve_project_paths(project: dict) -> dict:
+    """Auto-fix db_path and claude_md if they point to directories instead of files."""
+    path = project.get("path", "")
+
+    db_path = project.get("db_path", "")
+    if db_path and os.path.isdir(db_path):
+        db_path = os.path.join(db_path, "agent.db")
+        project["db_path"] = db_path
+    elif not db_path and path:
+        db_path = os.path.join(path, "agent.db")
+        project["db_path"] = db_path
+
+    claude_md = project.get("claude_md", "")
+    if claude_md and os.path.isdir(claude_md):
+        claude_md = os.path.join(claude_md, "CLAUDE.md")
+        project["claude_md"] = claude_md
+    elif not claude_md and path:
+        claude_md = os.path.join(path, "CLAUDE.md")
+        project["claude_md"] = claude_md
+
+    return project
+
 def load_projects() -> list:
     if not os.path.exists(PROJECTS_PATH):
         return []
     with open(PROJECTS_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        projects = json.load(f)
+    return [_resolve_project_paths(p) for p in projects]
 
 def save_projects(projects: list):
     with open(PROJECTS_PATH, "w", encoding="utf-8") as f:
@@ -172,6 +222,17 @@ def save_projects(projects: list):
 def _get_project_db_path(project_id: str):
     project = next((p for p in load_projects() if p["id"] == project_id), None)
     return project.get("db_path") if project else None
+
+def ensure_project_files(project: dict):
+    """Ensure agent.db and CLAUDE.md exist for a project."""
+    db_path = project.get("db_path", "")
+    if db_path:
+        ensure_project_db(db_path)
+    claude_md = project.get("claude_md", "")
+    if claude_md and not os.path.exists(claude_md):
+        os.makedirs(os.path.dirname(claude_md), exist_ok=True)
+        with open(claude_md, "w", encoding="utf-8") as f:
+            f.write(f"# {project.get('name', 'Project')}\n")
 
 def ensure_project_db(db_path: str):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -419,6 +480,8 @@ def engineer_system_prompt(project: dict) -> str:
     if claude_md and os.path.exists(claude_md):
         with open(claude_md, "r", encoding="utf-8") as f:
             base = f.read().strip() + "\n\n"
+    import sys as _sys
+    py = _sys.executable.replace("\\", "/")
     project_id = project.get("id", "unknown")
     project_path = project.get("path", "")
     db_path = project.get("db_path", "")
@@ -438,7 +501,7 @@ def engineer_system_prompt(project: dict) -> str:
         f"The user will approve or reject through the UI — never ask 'should I go ahead?' or 'want me to make this edit?'.\n\n"
         f"1. EXECUTE this Bash command to submit the request (replace placeholders):\n"
         f"```bash\n"
-        f'python -c "\nimport sqlite3, uuid, datetime\n'
+        f'{py} -c "\nimport sqlite3, uuid, datetime\n'
         f'conn = sqlite3.connect(r\'{db_path}\')\n'
         f'aid = str(uuid.uuid4())[:8]\n'
         f'now = datetime.datetime.now().isoformat()\n'
@@ -450,7 +513,7 @@ def engineer_system_prompt(project: dict) -> str:
         f"```\n\n"
         f"2. Poll until approved or rejected:\n"
         f"```bash\n"
-        f'python -c "\nimport sqlite3, time\n'
+        f'{py} -c "\nimport sqlite3, time\n'
         f'conn = sqlite3.connect(r\'{db_path}\')\n'
         f'while True:\n'
         f'    row = conn.execute(\'SELECT status FROM approvals WHERE id=?\', [\'<approval_id>\']).fetchone()\n'
@@ -463,7 +526,7 @@ def engineer_system_prompt(project: dict) -> str:
         f"## Marking tasks done\n"
         f"When all file changes are approved and the task is complete:\n"
         f"```bash\n"
-        f'python -c "import sqlite3, datetime; conn = sqlite3.connect(r\'{db_path}\'); conn.execute(\'UPDATE tasks SET status=\\\"done\\\", result=?, updated_at=? WHERE id=?\', [\'done - waiting for PM approval: <summary>\', datetime.datetime.now().isoformat(), \'<task_id>\']); conn.commit(); conn.close()"\n'
+        f'{py} -c "import sqlite3, datetime; conn = sqlite3.connect(r\'{db_path}\'); conn.execute(\'UPDATE tasks SET status=\\\"done\\\", result=?, updated_at=? WHERE id=?\', [\'done - waiting for PM approval: <summary>\', datetime.datetime.now().isoformat(), \'<task_id>\']); conn.commit(); conn.close()"\n'
         f"```\n"
     )
     return base + rules
@@ -496,7 +559,9 @@ def cli_pm_system_prompt() -> str:
             parts.append(f"## Your memory from previous sessions\n\n{memory}")
 
     # Tool instructions — use pm_cli_tools.py for all operations
-    tools_script = os.path.join(UI_DIR, "pm_cli_tools.py").replace("\\", "\\\\")
+    import sys as _sys
+    python_cmd = _sys.executable.replace("\\", "/")
+    tools_script = os.path.join(UI_DIR, "pm_cli_tools.py").replace("\\", "/")
 
     tool_instructions = f"""## Your tools
 You have access to: Read, Glob, Grep, and Bash (ONLY for running pm_cli_tools.py).
@@ -515,52 +580,52 @@ All operations go through pm_cli_tools.py. Replace <placeholders> with actual va
 
 ### List all projects
 ```bash
-python {tools_script} get_projects
+{python_cmd} {tools_script} get_projects
 ```
 
 ### Create a task for a project engineer
 ```bash
-python {tools_script} create_task '{{"project_id": "<project_id>", "description": "<what to do>"}}'
+{python_cmd} {tools_script} create_task '{{"project_id": "<project_id>", "description": "<what to do>"}}'
 ```
 
 ### Get tasks for a project (all statuses)
 ```bash
-python {tools_script} get_tasks '{{"project_id": "<project_id>"}}'
+{python_cmd} {tools_script} get_tasks '{{"project_id": "<project_id>"}}'
 ```
 
 ### Complete a task
 ```bash
-python {tools_script} complete_task '{{"project_id": "<project_id>", "task_id": "<task_id>", "result": "<summary>"}}'
+{python_cmd} {tools_script} complete_task '{{"project_id": "<project_id>", "task_id": "<task_id>", "result": "<summary>"}}'
 ```
 
 ### Wake an engineer to process tasks
 ```bash
-python {tools_script} wake_engineer '{{"project_id": "<project_id>"}}'
+{python_cmd} {tools_script} wake_engineer '{{"project_id": "<project_id>"}}'
 ```
 
 ### Ask an engineer a question (waits for response)
 ```bash
-python {tools_script} ask_engineer '{{"project_id": "<project_id>", "message": "<question>"}}'
+{python_cmd} {tools_script} ask_engineer '{{"project_id": "<project_id>", "message": "<question>"}}'
 ```
 
 ### Write to the live feed
 ```bash
-python {tools_script} write_feed '{{"summary": "<text>", "project_id": "<project_id>", "event_type": "<info|task_created|task_done|bug|question>"}}'
+{python_cmd} {tools_script} write_feed '{{"summary": "<text>", "project_id": "<project_id>", "event_type": "<info|task_created|task_done|bug|question>"}}'
 ```
 
 ### Save PM memory
 ```bash
-python {tools_script} save_memory '{{"content": "<your notes>"}}'
+{python_cmd} {tools_script} save_memory '{{"content": "<your notes>"}}'
 ```
 
 ### Cleanup completed tasks
 ```bash
-python {tools_script} cleanup_tasks '{{"project_id": "<project_id>"}}'
+{python_cmd} {tools_script} cleanup_tasks '{{"project_id": "<project_id>"}}'
 ```
 
 ### Get all central task status
 ```bash
-python {tools_script} get_all_status
+{python_cmd} {tools_script} get_all_status
 ```
 
 ### Read files / List directories
@@ -697,7 +762,7 @@ def execute_pm_tool(name: str, tool_input: dict) -> str:
                 f"Read {claude_md_path} for project conventions, then check your task queue.\n\n"
                 f"To read your pending tasks, run:\n"
                 f"```bash\n"
-                f'python -c "import sqlite3; conn = sqlite3.connect(r\'{db_path}\'); rows = conn.execute(\'SELECT id, description FROM tasks WHERE status=\\\"pending\\\"\').fetchall(); [print(f\\\"Task {{r[0]}}: {{r[1]}}\\\") for r in rows]; conn.close()"\n'
+                f'{py} -c "import sqlite3; conn = sqlite3.connect(r\'{db_path}\'); rows = conn.execute(\'SELECT id, description FROM tasks WHERE status=\\\"pending\\\"\').fetchall(); [print(f\\\"Task {{r[0]}}: {{r[1]}}\\\") for r in rows]; conn.close()"\n'
                 f"```\n\n"
                 f"Process each task. Remember: you CANNOT write files directly — use the approval system described in your system prompt.\n"
             )
