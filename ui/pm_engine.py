@@ -481,7 +481,7 @@ def engineer_system_prompt(project: dict) -> str:
         with open(claude_md, "r", encoding="utf-8") as f:
             base = f.read().strip() + "\n\n"
     import sys as _sys
-    py = _sys.executable.replace("\\", "\\\\")
+    py = _sys.executable.replace("\\", "/")
     project_id = project.get("id", "unknown")
     project_path = project.get("path", "")
     db_path = project.get("db_path", "")
@@ -560,8 +560,8 @@ def cli_pm_system_prompt() -> str:
 
     # Tool instructions — use pm_cli_tools.py for all operations
     import sys as _sys
-    python_cmd = _sys.executable.replace("\\", "\\\\")
-    tools_script = os.path.join(UI_DIR, "pm_cli_tools.py").replace("\\", "\\\\")
+    python_cmd = _sys.executable.replace("\\", "/")
+    tools_script = os.path.join(UI_DIR, "pm_cli_tools.py").replace("\\", "/")
 
     tool_instructions = f"""## Your tools
 You have access to: Read, Glob, Grep, and Bash (ONLY for running pm_cli_tools.py).
